@@ -1,0 +1,1304 @@
+---
+title: "sensitivity analysis"
+output: html_document
+date: '2022-07-05'
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Model
+```{r libraries}
+library(tidyverse)
+library (rootSolve)
+
+```
+
+
+```{r constants}
+#constants for root mass, root radius, and canopy radius and leaf area
+m_const<-25.5
+#root mass ( dbh vs mass https://www.sciencedirect.com/science/article/pii/S0961953411003874?casa_token=i_Amf1zZCcMAAAAA:iRaxjopt55sVRRWOfKXIrXS5IWLGZTtt-75qaeiwKcqqKp6fzqG0rlmGDQ-j28INRmSzfufApg)
+r_const<-133.69 #root radius
+c_const<-62.7034 #canopy radius
+LA_const<-8125 #leaf area
+
+#exponents
+a<-2.134 #root mass
+b<-2/3 #root radius
+beta<-.76 #canopy radius  #perhaps this should be 4/3 2009 west
+alpha<-2 #leaf area
+
+#other const.
+r_dens<-0.2 # density of root tissue g/cm^3(?) (ranges from 0.2 to 0.8 g/cm^3 in https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/j.1365-2435.2012.02020.x)
+
+P<-6 #number of neighbors
+sp_prop<-1 #proportion of forest that is of the focal sp
+
+gamma<--2 #Our model shows how the number of trees in a size class, (delta)nk, decreases with trunk radius, rk, as (delta)nk /prop rk-2
+fine_root_only<-86.9
+adult_size<-2.5
+#cm radius
+```
+
+# allometric functions
+```{r allometric functions}
+#leaf area
+LA_func<-function(rad_stem){
+  Area<-LA_const*rad_stem^alpha
+  return(Area)
+}
+
+#canopy radius
+Canopy_func<-function(rad_stem){
+  Radius<-c_const*rad_stem^beta
+  return(Radius)
+}
+
+
+#root radius
+Root_rad_func<-function(rad_stem){
+  Radius<-r_const*rad_stem^b
+  return(Radius)
+}
+
+#rroot mass 
+Root_mass_func<-function(rad_stem){
+  M<-m_const*rad_stem^a
+  return(M)
+}
+
+
+
+
+
+```
+
+# other functions
+```{r other func}
+
+#Canopy area
+Canopy_A_func<-function(rad_stem){
+  Radius<-Canopy_func(rad_stem)
+  A<-pi*Radius^2
+  return(A)
+}
+
+#root Volume (hemisphere)
+Root_vol_func<-function(rad_stem){
+  Radius<-Root_rad_func(rad_stem)
+  V<-2/3*pi*Radius^3
+  return(V)
+}
+
+
+# root Density
+root_density_func<-function(rad_stem){
+  r_tissue_vol<-Root_mass_func(rad_stem)/r_dens
+  delta<-r_tissue_vol/Root_vol_func(rad_stem)
+  return(delta)
+}
+
+#root vol overlap
+V_overlap_func<-function(rad_stem, dist){
+  r_root<-Root_rad_func(rad_stem)-fine_root_only
+  r_root[r_root<0]<-0# structural roots
+  difference_term<-2*r_root-dist
+  difference_term[difference_term<0]<-0
+  V<-(pi*((difference_term)^2)*(dist^2+4*dist*r_root))/(24*dist)
+  #if ((2*r_root-dist)>0) {
+  #  V<-(pi*((2*r_root-dist)^2)*(dist^2+4*dist*r_root))/(24*dist)
+  #}else{
+  #  V<-0
+  #}
+  
+  return(V)
+}
+V_overlap_func_conical<-function(rad_stem, dist){
+  r_root<-Root_rad_func(rad_stem)
+  V<-(pi*((2*r_root-dist)^2)*(dist^2+4*r_root))/(24*dist)
+  return(V)
+}
+  
+```
+
+## Now find 'average' tree
+```{r avg radius setup}
+
+Av_tree_func<-function(r_max1){
+if (gamma==-2) {
+   avg_r<-(((gamma+1)*(r_max1^(-gamma)))/(r_max1-adult_size^(gamma+1)*r_max1^(-gamma)))*log(r_max1/adult_size) #note log-ln
+}
+  if (gamma!=-2) {
+   avg_r<-(((gamma+1)*r_max1^(-gamma))/((gamma+2)(r_max1-adult_size^(gamma+1)*r_max1^(-gamma))))*(r_max1^(gamma+2)-adult_size^(gamma+2))
+ }
+   return(avg_r)
+ }
+```
+
+```{r avg radius calculate}
+
+r_max_vec<-seq(from=adult_size+1,to=100, by=.1)
+
+r_avg_vec<-Av_tree_func(r_max_vec)
+  
+ggplot()+
+  geom_line(aes(x=r_max_vec,y=r_avg_vec))+
+  ggtitle("Average Tree Radius Vs Maximum Tree Radius")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Average Radius (cm)")
+```
+
+# set up variable
+```{r stemvec avg}
+r_stem_vec<-r_avg_vec
+
+```
+
+
+
+# find missing canopy cover
+
+```{r M avg}
+
+#leaf area density across the whole forest
+leaf_area_density_total<-LA_func(r_max_vec)/Canopy_A_func(r_max_vec)
+
+#missing leaf area above a single canopy
+M_LA<-leaf_area_density_total*Canopy_A_func(r_stem_vec)-LA_func(r_stem_vec)
+
+#extra LA [per neighbor] required to fill leaf area deficit
+overlap_per_neighbor<-M_LA/P
+
+#overlap proportion per neighbor
+f<-overlap_per_neighbor/LA_func(r_stem_vec)
+
+#dist_func
+ggplot()+
+  geom_line(aes(x=r_max_vec,y=f))+
+  ggtitle("Canopy Overlap Vs Maximum Tree Radius")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Fraction of Canopy Overlap")
+ggplot()+
+  geom_line(aes(x=r_avg_vec,y=f))+
+  ggtitle("Canopy Overlap Vs Average Tree Radius ")+
+  xlab("Average Radius (cm)") +
+  ylab("Fraction of Canopy Overlap")
+
+```
+
+# determine distance between trees
+```{r dist avg}
+
+  fun2<-function(x, frac){
+  func<-x-pi*frac-sin(x) #solve for interior angle theta
+  return(func)
+}
+```
+
+
+```{r dist2 avg}
+dist_vec<-vector(mode="numeric", length = length(r_stem_vec))
+
+#perhaps need to increase number of neighbors for really small trees
+
+dist_vec<-vector(mode="numeric", length = length(r_stem_vec))
+for (i in 1:length(r_stem_vec)) {
+    s<-uniroot(f=fun2,interval = c(0,200), frac=f[i])
+  dist_vec[i]<-cos(as.numeric(s[1])/2)*Canopy_func(r_stem_vec[i])*2
+}
+```
+
+
+# Calculate grafts
+```{r calculate grafts}
+root_density<-root_density_func(r_stem_vec)
+V_overlap<-V_overlap_func(r_stem_vec,dist_vec)
+
+GraftsPerNeighbor<-root_density^2*V_overlap
+
+GraftsPerTree<-GraftsPerNeighbor*P*sp_prop
+
+```
+
+
+
+```{r plot grafts vs rmax}
+ggplot()+
+  geom_line(aes(x=r_max_vec,y=GraftsPerTree))+
+  ggtitle("Predicted Grafts per Average Tree Vs Maximum Tree Radius")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per Tree")
+
+plot(r_max_vec,root_density)
+plot(r_max_vec, V_overlap)
+plot(r_max_vec, dist_vec)
+```
+```{r plot grafts vs stemvec}
+ggplot()+
+  geom_line(aes(x=r_avg_vec,y=GraftsPerTree))+
+  ggtitle("Predicted Grafts per Average Tree Vs Average Tree Radius")+
+  xlab("Avg Radius (cm)") +
+  ylab("Grafts per Tree")
+
+plot(r_stem_vec,root_density)
+plot(r_stem_vec, V_overlap)
+plot(r_stem_vec, dist_vec)
+```
+
+
+# Automate and analyze/simulate real data
+
+```{r model-run function w  given max}
+Model_func1<-function(r_maximum){
+  #average tree
+  r_average<-Av_tree_func(r_maximum)
+  
+  
+  #leaf area density across the whole forest
+leaf_area_density_total_mod<-LA_func(r_maximum)/Canopy_A_func(r_maximum)
+
+#missing leaf area above a single canopy
+M_LA_mod<-leaf_area_density_total_mod*Canopy_A_func(r_average)-LA_func(r_average)
+
+#extra LA [per neighbor] required to fill leaf area deficit
+overlap_per_neighbor_mod<-M_LA_mod/P
+
+#overlap proportion per neighbor
+f_mod<-overlap_per_neighbor_mod/LA_func(r_average)
+
+dist_vec_mod<-vector(mode="numeric", length = length(r_average))
+
+for (i in 1:length(r_average)) {
+    s<-uniroot(f=fun2,interval = c(0,200), frac=f_mod[i])
+  dist_vec_mod[i]<-cos(as.numeric(s[1])/2)*Canopy_func(r_average[i])*2
+}
+root_density_mod<-root_density_func(r_average)
+V_overlap_mod<-V_overlap_func(r_average,dist_vec_mod)
+
+GraftsPerNeighbor_mod<-root_density_mod^2*V_overlap_mod
+
+GraftsPerTree_mod<-GraftsPerNeighbor_mod*P*sp_prop
+
+return(GraftsPerTree_mod)
+}
+```
+
+```{r model run func w given average and dist}
+Model_func2<-function(r_average, dist_vec_mod){
+root_density_mod<-root_density_func(r_average)
+V_overlap_mod<-V_overlap_func(r_average,dist_vec_mod)
+
+GraftsPerNeighbor_mod<-root_density_mod^2*V_overlap_mod
+
+GraftsPerTree_mod<-GraftsPerNeighbor_mod*P*sp_prop
+
+return(GraftsPerTree_mod)
+}
+```
+
+
+```{r read csv}
+root_data<-read_csv("root graft data.csv")
+```
+
+```{r set up predictions }
+
+#P<-4
+#root_data$distance_approx<-sqrt((10^8)/(root_data$tree_density))
+
+P<-6
+root_data$distance_approx<-2*sqrt((10^8)/(pi*root_data$tree_density))
+
+
+root_data$stem_radius<-.5*root_data$mean_dbh
+root_data$predicted_grafts<-Model_func2(root_data$stem_radius,root_data$distance_approx)
+```
+
+
+
+
+## sensitivity analysis
+```{r consts}
+#constants for root mass, root radius, and canopy radius and leaf area
+m_const<-25.5
+#root mass ( dbh vs mass https://www.sciencedirect.com/science/article/pii/S0961953411003874?casa_token=i_Amf1zZCcMAAAAA:iRaxjopt55sVRRWOfKXIrXS5IWLGZTtt-75qaeiwKcqqKp6fzqG0rlmGDQ-j28INRmSzfufApg)
+r_const<-133.69 #root radius
+c_const<-62.7034 #canopy radius
+LA_const<-8125 #leaf area
+
+#exponents
+a<-2.134 #root mass
+b<-2/3 #root radius
+beta<-.76 #canopy radius  #perhaps this should be 4/3 2009 west
+alpha<-2 #leaf area
+
+#other const.
+r_dens<-0.2 # density of root tissue g/cm^3(?) (ranges from 0.2 to 0.8 g/cm^3 in https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/j.1365-2435.2012.02020.x)
+
+P<-6 #number of neighbors
+sp_prop<-1 #proportion of forest that is of the focal sp
+
+gamma<--2 #Our model shows how the number of trees in a size class, (delta)nk, decreases with trunk radius, rk, as (delta)nk /prop rk-2
+fine_root_only<-86.9
+adult_size<-2.5
+#cm radius
+
+
+
+
+```
+
+```{r}
+param_vary_coarse<-c(0.1,0.5,0.75,0.9,0.95,0.99,1,1.01,1.05,1.1,1.25,1.5,2)
+param_vary_fine<-seq(from=0.8, to=1.2, by=0.01)
+df<-matrix(data=0,nrow=length(r_max_vec), ncol=length(param_vary_coarse)+3)
+df<-as.data.frame(df)
+colnames(df)<-as.character(c("r_max", "original", "avg", param_vary_coarse))
+```
+
+```{r save originals}
+
+Original_GPT<-Model_func1(r_max_vec)
+Original_Avg_Tree<-Av_tree_func(r_max_vec)
+Original_dist<-dist_vec
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+df[,3]<-Original_Avg_Tree
+```
+
+
+
+```{r m_const}
+#m_const
+m_const<-25.5
+m_const_vary<-param_vary_coarse*m_const
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  m_const<-m_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+m_const<-25.5
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_m_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("mass constant sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("mass constant sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+
+P_m_const
+
+```
+
+
+```{r r_const}
+r_const<-133.69 #root radius
+r_const_vary<-param_vary_coarse*r_const
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  r_const<-r_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+r_const<-133.69 #root radius
+
+df_long<-df %>% pivot_longer(cols = c(5:ncol(df)), names_to = "name")
+
+# note: 0.1 is even stranger
+P_r_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("rooting extent radius constant sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("rooting extent radius constant sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+
+P_r_const
+
+```
+
+
+
+```{r c_const}
+c_const<-62.7034 #canopy radius
+c_const_vary<-param_vary_coarse*c_const
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  c_const<-c_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+c_const<-62.7034 #canopy radius
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_c_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("canopy radius constant sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("canopy radius constant sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_c_const
+
+```
+
+
+```{r LA_const}
+LA_const<-8125 #leaf area
+LA_const_vary<-param_vary_coarse*LA_const
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  LA_const<-LA_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+c_const<-62.7034 #canopy radius
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_LA_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("Leaf Area constant sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("Leaf Area constant sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_LA_const
+
+```
+
+
+```{r a exp}
+a<-2.134 #root mass
+a_const_vary<-param_vary_coarse*a
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  a<-a_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+a<-2.134 #root mass
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_a_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_a_const
+
+df_long<-df %>% pivot_longer(cols = c(3:(ncol(df)-2)), names_to = "name")
+
+P_a_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_a_const
+
+
+
+```
+
+
+
+
+```{r b exp}
+b<-2/3 #root radius
+b_const_vary<-param_vary_coarse*b
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  b<-b_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+b<-2/3 #root radius
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_b_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_b_const
+
+df_long<-df %>% pivot_longer(cols = c(5:ncol(df)), names_to = "name")
+
+P_b_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_b_const
+
+```
+
+
+```{r beta}
+beta<-.76 #canopy radius
+beta_const_vary<-beta*param_vary_coarse[1:10]
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 2:length(beta_const_vary)) {
+  beta<-beta_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+beta<-.76 #canopy radius
+
+df_long<-df %>% pivot_longer(cols = c(5:12), names_to = "name")
+
+P_beta_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_beta_const
+```
+
+```{r alpha}
+alpha<-2 #leaf area
+
+
+alpha_const_vary<-alpha*param_vary_coarse
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 4:length(alpha_const_vary)) {
+  alpha<-alpha_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+alpha<-2 #leaf area
+
+df_long<-df %>% pivot_longer(cols = c(8:(ncol(df))), names_to = "name")
+
+P_alpha_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("LA exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("LA exponent sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+  
+
+P_alpha_const
+```
+
+
+
+```{r r_dens}
+r_dens<-0.2
+
+
+r_dens_const_vary<-r_dens*param_vary_coarse
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  r_dens<-r_dens_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+r_dens<-0.2
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_r_dens_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("r_dens exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("r_dens exponent sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_r_dens_const
+
+df_long<-df %>% pivot_longer(cols = c(5:ncol(df)), names_to = "name")
+
+P_r_dens_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("r_dens exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_r_dens_const
+
+```
+
+
+
+
+
+
+```{r P}
+P<-6 #number of neighbors
+
+
+P_const_vary<-P*param_vary_coarse
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  P<-P_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+P<-6 #number of neighbors
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_P_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("P sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("P sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+
+P_P_const
+
+```
+
+```{r fine_root_only}
+fine_root_only<-86.9
+
+
+fro_const_vary<-fine_root_only*param_vary_coarse
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:length(param_vary_coarse)) {
+  fine_root_only<-fro_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+fine_root_only<-86.9
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_fro_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("Fine root only sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+ggplot(df_long)+
+  geom_line(aes(x=avg,y=value, color=name))+
+  geom_line(aes(x=avg,y=original), color="black",size=1)+
+  ggtitle("Fine root only sensitivity analysis")+
+  xlab("avg Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_fro_const
+
+```
+
+```{r adult_size}
+adult_size<-2.5
+
+as_const_vary<-adult_size*param_vary_coarse
+
+df[,1]<-r_max_vec
+df[,2]<-Original_GPT
+for (i in 1:11) {
+  adult_size<-as_const_vary[i]
+  df[,i+3]<-Model_func1(r_max_vec)
+}
+adult_size<-2.5
+
+df_long<-df %>% pivot_longer(cols = c(4:(ncol(df)-2)), names_to = "name")
+
+P_fro_const<-ggplot(df_long)+
+  geom_line(aes(x=r_max,y=value, color=name))+
+  geom_line(aes(x=r_max,y=original), color="black",size=1)+
+  ggtitle("adult size sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_fro_const
+
+```
+
+
+## sensitivity on actual predictions
+
+```{r set it up}
+
+
+df<-matrix(data=0,nrow=length(root_data$mean_dbh), ncol=length(param_vary_coarse)+3)
+df<-as.data.frame(df)
+colnames(df)<-as.character(c("stem_radius", "mean distance", "original", param_vary_coarse))
+df$stem_radius<-root_data$stem_radius
+df$`mean distance`<-root_data$distance_approx
+df$`original`<-root_data$observed_grafts_per_tree
+df<-df %>% na.omit()
+
+```
+
+
+
+```{r m_const2}
+#m_const
+m_const<-25.5
+m_const_vary<-param_vary_coarse*m_const
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  m_const<-m_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+m_const<-25.5
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_m_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("mass constant sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+
+P_m_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("mass constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+```
+
+
+```{r r_const2}
+r_const<-133.69 #root radius
+r_const_vary<-param_vary_coarse*r_const
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  r_const<-r_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+r_const<-133.69 #root radius
+
+df_long<-df %>% pivot_longer(cols = c(6:ncol(df)), names_to = "constant")
+
+P_r_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=constant))+geom_smooth(aes(x=stem_radius,y=value, color=constant), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("rooting extent radius constant sensitivity analysis")+
+  xlab("DBH (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_r_const
+
+
+ df_long<-df %>% pivot_longer(cols = c(7:(ncol(df))), names_to = "constant")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=constant))+geom_smooth(aes(x=value,y=original, color=constant), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("r const sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+```
+
+
+
+```{r c_const2}
+c_const<-62.7034 #canopy radius
+c_const_vary<-param_vary_coarse*c_const
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  c_const<-c_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+c_const<-62.7034 #canopy radius
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_c_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("canopy radius constant sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+  
+
+P_c_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("c constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+
+```
+
+
+```{r LA_const2}
+LA_const<-8125 #leaf area
+LA_const_vary<-param_vary_coarse*LA_const
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  LA_const<-LA_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+c_const<-62.7034 #canopy radius
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_LA_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("Leaf Area constant sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+
+
+P_LA_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("la constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+
+```
+
+
+```{r a exp2}
+a<-2.134 #root mass
+a_const_vary<-param_vary_coarse*a
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  a<-a_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+a<-2.134 #root mass
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_a_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+
+
+P_a_const
+
+df_long<-df %>% pivot_longer(cols = c(4:(ncol(df)-2)), names_to = "name")
+
+P_a_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("root mass exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_a_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("a constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+
+```
+
+
+
+
+```{r b exp2}
+b<-2/3 #root radius
+b_const_vary<-param_vary_coarse*b
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  b<-b_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+b<-2/3 #root radius
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_b_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("root r exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_b_const
+
+df_long<-df %>% pivot_longer(cols = c(6:ncol(df)), names_to = "name")
+
+P_b_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("root r exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_b_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("root r constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+```
+
+
+```{r beta2}
+beta<-.76 #canopy radius
+beta_const_vary<-beta*param_vary_coarse[1:10]
+
+ 
+ 
+for (i in 2:length(beta_const_vary)) {
+  beta<-beta_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+beta<-.76 #canopy radius
+
+df_long<-df %>% pivot_longer(cols = c(5:12), names_to = "name")
+
+P_beta_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("canopy r exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+
+  
+
+P_beta_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("c exp constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+```
+
+```{r alpha2}
+alpha<-2 #leaf area
+
+
+alpha_const_vary<-alpha*param_vary_coarse
+
+ 
+ 
+for (i in 4:length(alpha_const_vary)) {
+  alpha<-alpha_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+alpha<-2 #leaf area
+
+df_long<-df %>% pivot_longer(cols = c(8:(ncol(df))), names_to = "name")
+
+P_alpha_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("LA exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_alpha_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("la constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+```
+
+
+
+```{r r_dens2}
+r_dens<-0.2
+
+
+r_dens_const_vary<-r_dens*param_vary_coarse
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  r_dens<-r_dens_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+r_dens<-0.2
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_r_dens_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("r_dens exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+
+P_r_dens_const
+
+df_long<-df %>% pivot_longer(cols = c(5:ncol(df)), names_to = "name")
+
+P_r_dens_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("r_dens exponent sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_r_dens_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("dens constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+
+```
+
+
+
+
+
+
+```{r P2}
+P<-6 #number of neighbors
+
+
+P_const_vary<-P*param_vary_coarse
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  P<-P_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+P<-6 #number of neighbors
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_P_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("P sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+  
+
+P_P_const
+
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("p constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+```
+
+```{r fine_root_only2}
+fine_root_only<-86.9
+
+
+fro_const_vary<-fine_root_only*param_vary_coarse
+
+ 
+ 
+for (i in 1:length(param_vary_coarse)) {
+  fine_root_only<-fro_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+fine_root_only<-86.9
+
+df_long<-df %>% pivot_longer(cols = c(4:ncol(df)), names_to = "name")
+
+P_fro_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("Fine root only sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+
+
+P_fro_const
+
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("fro constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+
+```
+
+```{r adult_size2}
+adult_size<-2.5
+
+as_const_vary<-adult_size*param_vary_coarse
+
+for (i in 1:11) {
+  adult_size<-as_const_vary[i]
+  df[,i+3]<-Model_func2(df$stem_radius,df$`mean distance`)
+}
+adult_size<-2.5
+
+df_long<-df %>% pivot_longer(cols = c(4:(ncol(df)-2)), names_to = "name")
+
+P_as_const<-ggplot(df_long)+
+  geom_point(aes(x=stem_radius,y=value, color=name))+geom_smooth(aes(x=stem_radius,y=value, color=name), method=lm)+
+  geom_point(aes(x=stem_radius,y=original), color="black",size=1)+geom_smooth(aes(x=stem_radius,y=original), color="black",method="lm")+
+  ggtitle("adult size sensitivity analysis")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per average tree")
+ 
+P_as_const
+ 
+ df_long<-df %>% pivot_longer(cols = c(6:(ncol(df)-4)), names_to = "name")
+
+ggplot(df_long)+
+  geom_point(aes(x=value,y=original, color=name))+geom_smooth(aes(x=value,y=original, color=name), method=lm, se=F)+
+  geom_point(aes(x=original,y=original), color="black",size=1)+geom_smooth(aes(x=original,y=original), color="black",method="lm")+
+  ggtitle("as constant sensitivity analysis")+
+  xlab("predicted  grafts") +
+  ylab("actual grafts")
+```
+
+

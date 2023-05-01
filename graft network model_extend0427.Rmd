@@ -1,0 +1,1202 @@
+---
+title: "graft network model 0627"
+output:
+  html_document: default
+  pdf_document: default
+date: '2022-06-27'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+## setup
+
+```{r libraries}
+library(tidyverse)
+library(lattice)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+
+```
+# Model 
+This is a spatial model, set on a grid of (equidistant) "tree spots" that can either have a tree growing in them or be empty (note that for the same number of trees, the smaller the distance between grid spots and the higher the proportion of empty spots, the less even the distances between trees will be). At this stage of model development, all the trees are the same size. Two trees can graft only if their root radii overlap (using allometric scaling law to get radius from dbh). The amount of tree grafting is controlled by a "graftiness" parameter that tunes up or down the amount of grafting predicted by the random root distribution allometric model. This model has a timestepping element to watch tree/stand survival over time (with no recruitment). At each timestep, trees must uptake resources from the environment and use some of their stored resources to survive to the next timestep. Grafted trees incur a cost by losing some of their newly obtained resource to their grafted partners, but get a benefit of some of their grafted partner's obtained resource. 
+# constants
+We start by outlining the constants that define the size and various characteristics of the model.  All parameters are kept in this upcoming section so they are easy to find (e.g. for editing/tuning). 
+```{r model consts}
+# lattice attributes
+dimx<-10 #size of grid in x direction (number of "tree spots")
+dimy<-10 #size of grid in y direction
+dist<-250 #distance between stems/width of grid cells 
+
+# tree attributes
+r_stem<-8 #size of trees/stem radius in cm (1/2dbh)
+plantProportion<-0.8 #proportion of grid containing a plant at the beginning of the model run
+g<-1 #'graftiness' parameter--based on allometry model/parameters do tree roots encounter randomly (1), seek out (>1), or avoid (<1) grafting
+UptakeEfficiency<-1 #Resource uptake efficiency (how much of the resource availiable on each grid cell can each plant take up)
+GraftConnectionStrength<-0.2 #how much of one plant's uptaken resources does it lose to grafted partners via the graft
+
+
+# resource attributes
+resourceType<-"static" #controls resource updating via the resource update function
+r_variation<-1 #increases or decreases how much resource variation there is across lattice cells (for certain resourceType values where variation is relevant)
+r_diffusion<-0 #controls speed of resource diffusion across lattice cells (diffusion constant)
+ResourceCost<-1 #cost of surviving to the next turn
+min_resource<-0 #amount of resource below which tree cannot survive
+
+
+#timstepping simulation attributes
+timesteps<-300 #number of timesteps per replication 
+reps<-50 # number of replications
+maxg<-4 #maximum value of graftiness parameter g in simulation
+gStepSize<-0.1 #size of steps in g value vector for model run
+glength<-maxg/gStepSize # length of vector containing all g values for model run
+```
+
+This next code chunk contains the all the constants from the allometry-based model. 
+```{r allometry constants}
+#constants for root mass, root radius, and canopy radius and leaf area
+m_const<-25.5
+#root mass ( dbh vs mass https://www.sciencedirect.com/science/article/pii/S0961953411003874?casa_token=i_Amf1zZCcMAAAAA:iRaxjopt55sVRRWOfKXIrXS5IWLGZTtt-75qaeiwKcqqKp6fzqG0rlmGDQ-j28INRmSzfufApg)
+r_const<-133.69 #root radius
+c_const<-62.7034 #canopy radius
+LA_const<-8125 #leaf area
+
+#exponents
+a<-2.134 #root mass
+b<-2/3 #root radius
+beta<-.76 #canopy radius  #perhaps this should be 4/3 2009 west
+alpha<-2 #leaf area
+
+#other constants
+r_dens<-0.2 # density of root tissue g/cm^3 (ranges from 0.2 to 0.8 g/cm^3 in https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/j.1365-2435.2012.02020.x)
+
+P<-6 #number of neighbors (not needed for this model due to the explicit spatial structure)
+sp_prop<-1 #proportion of forest that is of the focal sp
+
+gamma<--2 #Our model shows how the number of trees in a size class, (delta)nk, decreases with trunk radius, rk, as (delta)nk /prop rk-2
+fine_root_only<-86.9 #extent of tree root radius that is made up of only fine roots (less than 1cm diameter), given by fractal structure
+adult_size<-2.5 #size of adult trees, cm radius (not needed for this model)
+
+```
+
+# allometric functions
+These are the functions from the allometric model I built in Santa Fe that are also used in this model
+```{r allometric model functions}
+#Scaling functions
+###all these functions take the form Output<- allometric_constant*Input^allometric_exponent
+
+#leaf area (area of leaves of a tree canopy in cm^2 )
+LA_func<-function(rad_stem){
+  Area<-LA_const*rad_stem^alpha
+  return(Area)
+}
+
+#canopy radius (radial extent of tree canopy in cm)
+Canopy_func<-function(rad_stem){
+  Radius<-c_const*rad_stem^beta
+  return(Radius)
+}
+
+
+#root radius (radial extent of roots in cm)
+Root_rad_func<-function(rad_stem){
+  Radius<-r_const*rad_stem^b
+  return(Radius)
+}
+
+#root mass (dry root mass of tree in grams)
+Root_mass_func<-function(rad_stem){
+  M<-m_const*rad_stem^a
+  return(M)
+}
+
+
+
+##more functions
+# these functions serve various purposes in running/constructing the basic model
+
+
+#Canopy area--determines the ground area covered by a tree canopy
+Canopy_A_func<-function(rad_stem){
+  Radius<-Canopy_func(rad_stem)  #canopy radius from scaling function
+  A<-pi*Radius^2 #area formula
+  return(A)
+}
+
+#root Volume (hemisphere)--determines the volume of soil space covered by the tree's roots in cm^3
+Root_vol_func<-function(rad_stem){
+  Radius<-Root_rad_func(rad_stem) #root radius from scaling function
+  V<-2/3*pi*Radius^3 #volume formula
+  return(V)
+}
+
+# root Density--determines the density of root tissue in space (i.e. what proportion of the soil is filled by a root?)
+root_density_func<-function(rad_stem){
+  r_tissue_vol<-Root_mass_func(rad_stem)/r_dens #divide root mass by density to get volume of root tissue
+  delta<-r_tissue_vol/Root_vol_func(rad_stem) #divide tissue volume by soil volume to get proportion of space taken up by tree roots
+  return(delta)
+}
+
+#root vol overlap--finds the soil volume of overlap between the hemispherical root balls of two trees of a given size and distance in cm^3
+V_overlap_func<-function(rad_stem, dist){
+  r_root<-Root_rad_func(rad_stem)-fine_root_only #radius of coarse/structural roots
+  r_root[r_root<0]<-0 #account for case where all roots are too small
+  difference_term<-2*r_root-dist #difference term characterizes degree of overlap
+  difference_term[difference_term<0]<-0 #account for case with no overlap
+  V<-(pi*((difference_term)^2)*(dist^2+4*dist*r_root))/(24*dist) #Calculate volume of overlap (half intersection of spheres)
+  
+  return(V)
+}
+
+#run predictions based on known stem radius and known intertree distance
+Model_func2<-function(r_average, dist_vec_mod){
+root_density_mod<-root_density_func(r_average) #calculate root density in space
+V_overlap_mod<-V_overlap_func(r_average,dist_vec_mod) #calculate overlap in cm^3
+
+GraftsPerNeighbor_mod<-root_density_mod^2*V_overlap_mod #calculate expected grafts per neighbor
+ 
+GraftsPerTree_mod<-GraftsPerNeighbor_mod*P*sp_prop #calculate grafts per tree based on number of neighbors of the same species
+
+return(GraftsPerTree_mod)
+}
+```
+
+
+#model functions
+This section contains functions for grafting and timestepping in the spatial simulation. This section also includes code for including diffusion into the model, but I have not yet finalized the code and confirmed that it works correctly and as intended. I'm also not completely sure if resource diffusion is sufficiently powerful and meaningful for the scale at which I am looking at resources, and it's not included in the actual model runs/analysis at this stage. 
+```{r}
+#this function creates a matrix of the distances (cm) between each tree ("tree spot") and all other trees in the model
+Distances_func<-function(lattice_dist){
+  fRowMat<-matrix(data = 1:dimx,nrow=dimx,ncol=dimy) %>% as.vector() #what is the row number of each tree
+  fColMat<-(matrix(data = 1:dimy,nrow=dimy,ncol=dimx)) %>% t() %>% as.vector() #what is the column number of each tree
+  AllRow<-matrix(data=fRowMat,nrow=dimx*dimy,ncol=dimx*dimy) #expand rows into a matrix for each tree pair (values indicate one side)
+  AllCol<-matrix(data=fColMat,nrow=dimx*dimy,ncol=dimx*dimy) #expand cols into a matrix for each tree pair
+  DistanceMat<-lattice_dist*sqrt((t(AllCol)-fColMat)^2+(t(AllRow)-fRowMat)^2) #distance formula multiplied by grid size constant
+return(DistanceMat)
+}
+
+#This function calculates which intertree grafts are possible based on the size of the trees and the size of the simulation grid
+PossLinks_func<-function(PlantLattice,treerad,lattice_dist){
+  fPL<-as.vector(PlantLattice) #make a vector of the presence/absence of all trees in all tree spots
+  PossLinks1<-t(matrix(data=fPL,nrow=dimx*dimy, ncol=dimx*dimy))*fPL # Create a matrix of grafts that are possible based on both tree spots containing trees
+  root_rads<-Root_rad_func(treerad) # calculate root radii of the trees using allometric scaing relationship
+  DistanceMat<-Distances_func(lattice_dist) #calculate distances between all trees
+  PossLinks2<-DistanceMat<(2*root_rads)#create a matrix of grafts that are possible based on overlap between rooting extent radii of each tree pair
+  PossLinks3<-PossLinks1*PossLinks2 #combine the graft matrices to get pollsible links only where both trees exist and are close enough togther
+  return(PossLinks3)
+}
+
+
+#for each possible graft between trees, this function calculates the actual likelihood of that graft occurring based on the expected number of grafts between each pair of trees (from the allometric model), plus a "graftiness" parameter (graftsuccess)
+GraftingProb_func<-function(PossibleLinks, DistanceMat, treerad, graftsuccess){
+  intertree_dist<-0 #define variable
+  root_density<-0 #define variable
+  V_overlap<-0 #define variable
+  GraftsPerNeighbor<-0 #define variable
+  ProbabilityMat<-matrix(data=0,nrow=nrow(PossibleLinks),ncol=ncol(PossibleLinks)) #initialize output matrix
+  #loop over all entries of the stand 
+  for (i in 1:nrow(PossibleLinks)) {
+    for (j  in 1:ncol(PossibleLinks)) {
+      if (PossibleLinks[i,j]==1) { #for each pair of trees with possible links
+        intertree_dist<-DistanceMat[i,j] #find distance between trees
+        root_density<-root_density_func(treerad) #calculate root density in space of trees
+        V_overlap<-V_overlap_func(treerad,intertree_dist) #calculate volume of overlap area
+        GraftsPerNeighbor<-(root_density^2)*V_overlap*graftsuccess #calculated expected number of grafts between the two trees (probability of graft forming)
+        GraftsPerNeighbor<-min(GraftsPerNeighbor,1) #limit probability to 1 (could become an issue for high levels of graftsuccess, not sure how/if I need to implement multiple grafts per tree)
+        ProbabilityMat[i,j]<-GraftsPerNeighbor #fill in the probability matrix
+      }
+      
+    }
+    
+  }
+  return(ProbabilityMat)
+}
+
+#PerPlantUptakeFunc<-function(ResourceGrid,PlantGrid,UptakeEfficiency,treerad, distances){ #potential to make an uptake function  that can get resources from more than one grid square
+
+#function to describe the uptake of resources from the resource layer by each plant 
+
+
+
+PerPlantUptakeFunc<-function(ResourceGrid,PlantGrid,UptakeEfficiency){
+  
+  fResourceUptake<-ResourceGrid*PlantGrid*UptakeEfficiency #simple formula where each plant can get resources only from its "home" grid square/tree spot, modulated by the uptake efficiency value (0 to 1)
+dim(fResourceUptake)<-NULL # convert this to a vector
+
+return(fResourceUptake)
+}
+
+
+
+#this function determines the number of grafts per plant
+LinksPerPlantFunc<-function(Links, PlantGrid){
+  fLinksPerPlant<-rowSums(Links) #summing across rows gives number od grafts per plant
+  return(fLinksPerPlant)
+}
+
+#this function determines how much resource the plant can add to its stored amount in that turn based on the degree of grafting
+
+ResourceAdditionFunc<-function(fLinksPerPlant,fResourceUptake,LinksMat,fRPPGrid,GraftConnectionStrength){
+  GraftContribution<-as.numeric(fLinksPerPlant>0)*GraftConnectionStrength*fResourceUptake #for plants that have grafts, some of their resource uptake is directed to their partner (currently this doesn't depend on number of grafts but I may want to change that)
+  SelfContribution<-fResourceUptake-GraftContribution #how much of their own resource uptake does each plant keep
+  
+  Divisor<-fLinksPerPlant+as.numeric(fLinksPerPlant==0) #number of links that the graft contribution of each plant is split between (plus 1s to account for non-grafted plants)
+  GraftContribution<-GraftContribution/Divisor  #contribution to each graft partner
+  
+  GraftContribution<-LinksMat%*%GraftContribution #this distributes the contributions by graft locations
+  
+  fRPPGrid2<-fRPPGrid+SelfContribution+GraftContribution #this updates the resources per plant grid
+  
+  return(fRPPGrid2)
+  
+}
+
+ResourceDepletionFunc<-function(fRPPGrid,ResourceCost){
+  fRPPGrid<-fRPPGrid-ResourceCost #each plant incurs a cost  to stay alive for eachh timestep
+  fRPPGrid<-fRPPGrid*(fRPPGrid>0) #minimum of zero
+  return(fRPPGrid)
+}
+
+
+
+#the next functions deal with updating the resource grid
+
+
+#this function creates a diffusion operator for a discrete grid
+diffusionOperatorfunc<-function(boundary,dimx,dimz) {
+nx<-dimx #set up dimensions
+nz<-dimz #set up dimensions
+#boundary conditions of zero gradient (mirror)
+  if (boundary=="zero grad") {
+  #L matrix: matrix that calculates the left differences between cells
+  L<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+  for (i in 1:(nx*nz)) {
+    for (j in 1:(nx*nz)) {
+      if (i-1>0 && ceiling((i-1)/nx)==ceiling((i)/nx)) {
+        if (j==i) {
+          L[i,j]<--1
+        }
+        if(j==i-1){
+          L[i,j]<-1
+        }
+      }
+    }
+  }
+  #R matrix : calculates right differences between cells
+  R<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+  for (i in 1:(nx*nz)) {
+    for (j in 1:(nx*nz)) {
+      if (i+1<=(nx*nz) && ceiling((i+1)/nx)==ceiling((i)/nx)) {
+        if (j==i) {
+          R[i,j]<-1
+        }
+        if(j==i+1){
+          R[i,j]<--1
+        }
+      }
+    }
+  }
+  
+  # Up matrix  #calcluates differences with cells above 
+  U<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+  for (i in 1:(nx*nz)) {
+    for (j in 1:(nx*nz)) {
+      if (i-nz>0) {
+        if (j==i) {
+          U[i,j]<--1
+        }
+        if(j==(i-nz)){
+          U[i,j]<-1
+        }
+      }
+    }
+  }
+  #Dn matrix # calculates differences with cells below
+  D<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+  for (i in 1:(nx*nz)) {
+    for (j in 1:(nx*nz)) {
+      if (i+nz<=(nx*nz)) {
+        
+        if (j==i) {
+          D[i,j]<-1
+        }
+        if(j==(i+nz)){
+          D[i,j]<--1
+        }
+      }
+    }
+  }
+  OperatorMat<-((L-R)+(U-D)) #combine all matrices into the full operator that cares about letft to right and up to down differences
+  }
+  
+#diffusion with a "leaky" lower boundary so that things can drain out 
+  if (boundary=="bottom drain") {
+    #L matrix #left differences
+    L<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+    for (i in 1:(nx*nz)) {
+      for (j in 1:(nx*nz)) {
+        if (i-1>0 && ceiling((i-1)/nx)==ceiling((i)/nx)) {
+          if (j==i) {
+            L[i,j]<--1
+          }
+          if(j==i-1){
+            L[i,j]<-1
+          }
+        }
+      }
+    }
+    #R matrix #right differences
+    R<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+    for (i in 1:(nx*nz)) {
+      for (j in 1:(nx*nz)) {
+        if (i+1<=(nx*nz) && ceiling((i+1)/nx)==ceiling((i)/nx)) {
+          if (j==i) {
+            R[i,j]<-1
+          }
+          if(j==i+1){
+            R[i,j]<--1
+          }
+        }
+      }
+    }
+    
+    # Up matrix #abovove differences
+    U<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+    for (i in 1:(nx*nz)) {
+      for (j in 1:(nx*nz)) {
+        if (i-nz>0) {
+          if (j==i) {
+            U[i,j]<--1
+          }
+          if(j==(i-nz)){
+            U[i,j]<-1
+          }
+        }
+      }
+    }
+    #Dn matrix #below differences
+    D<-matrix(data=0,nrow=(nx*nz),ncol=(nx*nz)) 
+    for (i in 1:(nx*nz)) {
+      for (j in 1:(nx*nz)) {
+        #if (i+nz<=(nx*nz)) {
+          
+          if (j==i) {
+            D[i,j]<-1
+          }
+          if(j==(i+nz)){
+            D[i,j]<--1
+          }
+        #}
+      }
+    }
+    OperatorMat<-((L-R)+(U-D))
+    OperatorMat<-t(OperatorMat) #create the operator matrix
+  }
+  return(OperatorMat)
+}
+
+
+# this function works to update the resource grid at each timestep. So far I've only looked at the random reset update and the random change update but I wanted to at least write down a couple more ideas
+ResourceGridUpdateFunc<-function(ResourceGrid, PlantGrid, UptakeEfficiency,resourceVariationConst,resourceDiffusionConst, method, diffusion){
+  rGrid<-ResourceGrid #define variable
+  lossgrid<-0 #define  variable
+  #same exact resource grid at every timestep (e.g., some microhabitiats are just inherently better)
+  if (method=="static") {
+    rGrid<-ResourceGrid 
+  }
+  
+  #all cells are exactly the same
+  if (method=="uniform") {
+    rGrid<-matrix(data=1,nrow=dimx,ncol = dimy)
+  }
+  
+  #Entirely new resource grid at each timestep with varied values 
+  if (method=="random reset") {
+    rGrid<-matrix(data=rdunif(dimx*dimy,ceiling(2*r_variation),0),nrow=dimx,ncol = dimy) # uniform distribution 
+  }
+  
+  #resources deplete based on uptake and do not renew
+  if (method=="depletion only") {
+    lossgrid<-as.matrix(PerPlantUptakeFunc(ResourceGrid,PlantGrid,UptakeEfficiency),nrow=dimx,ncol = dimy) #uptake per plant
+    rGrid<-ResourceGrid-lossgrid #resources remaining
+    rGrid[rGrid<0]<-0 # minimum of zero
+  }
+  
+  #resources randomly increase or decrease in each cell
+  if (method=="random change") {
+    rGrid<-ResourceGrid+matrix(data=rnorm(dimx*dimy,0,sd=r_variation),nrow=dimx,ncol = dimy) #change in resource per timestep is driven by degree of resource variation constant 
+    rGrid[rGrid<0]<-0 #minimum of zero
+  }
+  
+  #includes diffusion if diffusion ==T is selected
+  if (diffusion==TRUE) {
+    D<-resourceDiffusionConst #resource diffusion constant 
+    dx<-dist #spatial scale
+    fvec<-t(rGrid) #flatten rGrid
+  dim(fvec)<-NULL
+  
+  #set up variables
+  fdiff<-c()
+  step1f<-c()
+  fplus<-c()
+  step2f<-c()
+  
+  #run 10 iterations of the method
+  for (m in 1:10) {
+    #runga-kutta method
+    #full discrete step
+    
+    fdiff<-D/(2*dx^2)*Operator%*%fvec
+    step1f<-fdiff
+    #step two
+    fplus<-fvec+dt*step1f
+    #second full discrete step
+    fdiff<-D/(2*dx^2)*Operator%*%fplus
+    step2f<-fdiff
+    #UPDATING TIME STEP
+    fvec<-fvec+dt/2*(step1f+step2f)
+    
+  }
+  rGrid<-matrix(data=fvec,nrow=dimx,ncol = dimy) # re-form the updated rGrid
+  }
+  return(rGrid)
+}
+
+```
+
+
+# set up environment
+These next few chunks of code will showcase the model's setup and structure (no timestepping  yet)
+```{r}
+#set up lattice of trees
+PlantGrid<-matrix(data=rbinom(dimx*dimy,1,plantProportion),nrow=dimx,ncol = dimy)
+
+#set up underlying resource matrix
+ResourceGrid<-matrix(data=rdunif(dimx*dimy,2,0),nrow=dimx,ncol = dimy)
+
+#set up resources possessed by each tree
+RPPGrid<-matrix(data=1,nrow=dimx,ncol = dimy)*PlantGrid
+
+#distance between each tree pair
+DistanceMatrix<-Distances_func(dist)
+
+# Adjacency matrix with possible Links between each tree pair
+PossLinks<-PossLinks_func(PlantLattice = PlantGrid, treerad = r_stem, lattice_dist = dist)
+colnames(PossLinks)<-(as.character(1:(dimx*dimy))) #name columns
+rownames(PossLinks)<-(as.character(1:(dimx*dimy))) #name rows
+diag(PossLinks)<-0 #no self-grafts
+
+#graft probability for each pair
+GraftProb<-GraftingProb_func(PossibleLinks = PossLinks ,DistanceMat = DistanceMatrix ,treerad = r_stem,graftsuccess = g)
+
+#actual grafts 
+ProbVec<-as.vector(GraftProb) #convert the graft probabilities to a vector
+ActualGrafts<-rbinom(ncol(PossLinks)*nrow(PossLinks),1,ProbVec) # Generate actual graft relationships based on the probilities
+ActualGrafts<-matrix(ActualGrafts, nrow=nrow(PossLinks),ncol=ncol(PossLinks)) #reshape actual grafts into matrix
+
+```
+
+visualize possible and actual networks
+```{r visualize possible network}
+
+#show the simulated tree stand
+levelplot(PlantGrid, cuts=1, col.regions = hcl.colors(2, palette = "Greens3", alpha = NULL, rev = TRUE, fixup = TRUE),colorkey=F)
+
+#show the locations of possible grafts
+levelplot(PossLinks, cuts=1, col.regions = hcl.colors(20, palette = "Earth", alpha = NULL, rev = FALSE, fixup = TRUE),colorkey=F)
+
+#show the distances between pairs of trees
+levelplot(DistanceMatrix, cuts=19, col.regions = hcl.colors(20, palette = "viridis", alpha = NULL, rev = FALSE, fixup = TRUE))
+
+#show the grafting probabilities between tree pairs
+levelplot(GraftProb, cuts=19, col.regions = hcl.colors(20, palette = "Earth", alpha = NULL, rev = FALSE, fixup = TRUE))
+
+#show the actual locations of simulated grafts
+levelplot(ActualGrafts, cuts=1, col.regions = hcl.colors(20, palette = "Earth", alpha = NULL, rev = FALSE, fixup = TRUE))
+
+#set up r network object
+
+#set up names (for presence/absence of trees)
+Live_trees<-as.vector(PlantGrid) %>% as.character() 
+Live_trees<-gsub(pattern = "1", "tree present", Live_trees)
+Live_trees<-gsub(pattern = "0", "tree absent", Live_trees)
+
+#create igraph object for possible grafts
+poss_net<-igraph::graph_from_adjacency_matrix(PossLinks)
+#add names
+V(poss_net)$color<-Live_trees
+
+#graph potential network
+ggraph(poss_net, layout="grid")+
+  geom_edge_link()+
+  geom_node_point(aes(color=color))+
+  ggtitle("POTENTIAL GRAFTS")
+#igraph::plot.igraph(poss_net, edge.width=1, edge.arrow_mode="-")
+
+#create igraph object for actual grafts
+actual_net<-igraph::graph_from_adjacency_matrix(ActualGrafts)
+#add names
+V(actual_net)$color<-Live_trees
+
+
+#graph actual graft network
+ggraph(actual_net, layout="grid")+
+  geom_edge_link()+
+  geom_node_point(aes(color=color))+
+  ggtitle("ACTUAL GRAFTS")
+
+```
+
+
+```{r characterize possible network}
+
+ExpectedGraftsPerTreeVec<-colSums(GraftProb) #calculate expected number of grafts per tree for all trees
+ExpectedGraftsPerTree<-mean(ExpectedGraftsPerTreeVec) #take mean to get mean of expected grafts per tree
+print(ExpectedGraftsPerTree) #print value
+
+GraftsPerTreeVec<-colSums(ActualGrafts) #find actual number of grafts per tree for all trees
+GraftsPerTreeAvg<-mean(GraftsPerTreeVec[GraftsPerTreeVec>0]) #mean number of grafts per grafted tree
+ProportionGraftedTrees<-sum(GraftsPerTreeVec>0)/sum(PlantGrid) #proportion of grafted trees
+print(c(GraftsPerTreeAvg, ProportionGraftedTrees, ProportionGraftedTrees*GraftsPerTreeAvg )) #display values
+```
+#  timestep setup
+This section runs the simulation of the stand. For each graftiness value, I created 100 unique stands, and then set them run for 100 timesteps each before recording survival of the stand. The idea is to use tree survival within the simulation as a metric for the impact of grafting. (Possible things to-do next: track fate of trees that started off grafted vs not grafted; add asymmetries in resource transport or add living stumps; test different resource behaviors).
+```{r simulate}
+
+
+fRPPGrid<-as.vector(RPPGrid) #convert resources per plant grid into a vector
+ActualGraftsSim<-ActualGrafts #create new graft matrix to track changes from beginning to end
+PlantGridSim<-PlantGrid #create new plant matrix to track changes
+ 
+
+#initialize results matrices (rows=replicates, columns=graftiness variations)
+resultsMat<-matrix(data = 0, nrow = reps, ncol = glength) #survival
+resultsMat2<-matrix(data = 0, nrow = reps, ncol = glength) #stored resources per plant
+resultsMat3<-matrix(data = 0, nrow = reps, ncol = glength) # initial grafts per tree
+resultsMat4<-matrix(data = 0, nrow = reps, ncol = glength) #initial proportion of grafted trees
+resultsMat5<-matrix(data = 0, nrow = reps, ncol = glength) # final grafts per tree
+resultsMat6<-matrix(data = 0, nrow = reps, ncol = glength) # final proportion of grafted trees
+resultsMat7<-matrix(data = 0, nrow = reps, ncol = glength) #grafts per grafted tree
+resultsMat8<-matrix(data = 0, nrow = reps, ncol = glength) #timestep of stand death (if applicable)
+
+#initialize results matrices (rows=replicates, columns=graftiness variations)
+g_resultsMat<-matrix(data = NA, nrow = reps, ncol = glength) #survival
+g_resultsMat2<-matrix(data = NA, nrow = reps, ncol = glength) #stored resources per plant
+ng_resultsMat2<-matrix(data = NA, nrow = reps, ncol = glength)
+
+original_g_resultsMat2<-matrix(data = NA, nrow = reps, ncol = glength) #stored resources per plant
+original_ng_resultsMat2<-matrix(data = NA, nrow = reps, ncol = glength)
+
+tree_nums<-c(rep(1,ceiling(.8*dimx*dimy)), rep(0,floor(.2*dimx*dimy)))
+#replicate 
+for (r in 1:reps) {
+  
+for (j in 1:glength) {
+  g<-(j-1)*gStepSize #set up the g value for the run
+  
+  #set up the simulated tree stand
+  
+  PlantGrid<-matrix(data=rbinom(dimx*dimy,1,plantProportion),nrow=dimx,ncol = dimy)
+
+#set up underlying resource matrix
+ResourceGrid<-matrix(data=rdunif(dimx*dimy,2,0),nrow=dimx,ncol = dimy)
+
+#set up resources possessed by each tree
+RPPGrid<-matrix(data=1,nrow=dimx,ncol = dimy)*PlantGrid
+
+#distance between each tree
+DistanceMatrix<-Distances_func(dist)
+
+# Adjacency matrix with possible Links
+PossLinks<-PossLinks_func(PlantLattice = PlantGrid, treerad = r_stem, lattice_dist = dist)
+colnames(PossLinks)<-(as.character(1:(dimx*dimy)))
+rownames(PossLinks)<-(as.character(1:(dimx*dimy)))
+diag(PossLinks)<-0 #remove self-grafting
+
+#graft probability
+GraftProb<-GraftingProb_func(PossibleLinks = PossLinks ,DistanceMat = DistanceMatrix ,treerad = r_stem,graftsuccess = g)
+
+#actual grafts
+ProbVec<-as.vector(GraftProb)
+ActualGrafts<-rbinom(ncol(PossLinks)*nrow(PossLinks),1,ProbVec) 
+ActualGrafts<-matrix(ActualGrafts, nrow=nrow(PossLinks),ncol=ncol(PossLinks))
+fRPPGrid<-as.vector(RPPGrid)
+
+ActualGraftsSim<-ActualGrafts #create new graft matrix to track changes from beginning to end
+PlantGridSim<-PlantGrid #create new plant matrix to track changes
+ 
+#for live stands, determine grafts per tree stats
+if(sum(PlantGrid)>0){
+  GraftsPerTreeVec<-colSums(ActualGraftsSim) #grafts per tree for all trees
+  GraftsPerTreeAvg<-mean(GraftsPerTreeVec[as.vector(PlantGridSim)>0]) #mean for all trees
+  GraftsPerGraftedTreeAvg<-mean(GraftsPerTreeVec[GraftsPerTreeVec>0]) #mean for all grafted trees
+  GraftsPerTreeAvg[is.nan(GraftsPerTreeAvg)] <- 0 #deal with nan
+  GraftsPerGraftedTreeAvg[is.nan(GraftsPerGraftedTreeAvg)] <- 0  #dean with nan
+  
+  ProportionGraftedTrees<-sum(GraftsPerTreeVec>0)/sum(PlantGridSim)  # proportion of trees with grafts
+  ProportionGraftedTrees[is.nan(ProportionGraftedTrees)] <- 0 #deal with nan
+  resultsMat3[r,j]=GraftsPerTreeAvg #fill in results matrix
+  resultsMat4[r,j]=ProportionGraftedTrees #fill in results matrix
+  Original_GraftsPerTreeVec<-GraftsPerTreeVec
+  } 
+
+#timestepping
+for (t in 1:timesteps) {
+  #update resource grid 
+  ResourceGrid<-ResourceGridUpdateFunc(ResourceGrid=ResourceGrid,PlantGrid=PlantGridSim,UptakeEfficiency=UptakeEfficiency,resourceVariationConst=r_variation,resourceDiffusionConst=r_diffusion, method=resourceType, diffusion=F) 
+  
+  #plants uptake resources
+  fResourceUptake<-PerPlantUptakeFunc(ResourceGrid=ResourceGrid , PlantGrid=PlantGridSim, UptakeEfficiency=UptakeEfficiency)
+  #record number of grafts per plant
+  fLinksPerPlant<-LinksPerPlantFunc(ActualGraftsSim)
+
+#update stored resources, with resource sharing via graft
+fRPPGrid<-ResourceAdditionFunc(fLinksPerPlant=fLinksPerPlant,fResourceUptake=fResourceUptake,LinksMat = ActualGraftsSim,fRPPGrid=fRPPGrid,GraftConnectionStrength = GraftConnectionStrength )
+
+#plants incur cost of survivning for this timestep
+fRPPGrid<-ResourceDepletionFunc(fRPPGrid=fRPPGrid,ResourceCost=ResourceCost)
+
+#Update plants and kill those with insufficient resources
+fPlantGrid<-as.numeric(fRPPGrid>0)
+PlantGridSim<-matrix(fPlantGrid,nrow=dimx,ncol=dimy)
+
+
+#update grafts (only by removing grafts to/from dead plants)
+PossLinks<-t(matrix(data=fPlantGrid,nrow=dimx*dimy,ncol=dimx*dimy))*fPlantGrid #what pairs of trees still exist
+ActualGraftsSim<-ActualGraftsSim*PossLinks #adjust original graft matrix
+
+#record time of stand death, if it has occurred
+if (sum(PlantGridSim)==0 & resultsMat8[r,j]==0) {
+  resultsMat8[r,j]<-t
+  
+}
+
+}
+
+#record number of surviving plants
+resultsMat[r,j]=sum(PlantGridSim)
+
+
+#for live stands, determine grafts per tree stats and record in results section
+if(sum(PlantGrid)>0){
+  resultsMat2[r,j]=sum(fRPPGrid)/sum(PlantGridSim) #resources per live tree
+  
+  GraftsPerTreeVec<-colSums(ActualGraftsSim) # grafts per tree for all trees
+  
+  GraftsPerTreeAvg<-mean(GraftsPerTreeVec[fPlantGrid>0]) #average grafts per liing tree
+  GraftsPerTreeAvg[is.nan(GraftsPerTreeAvg)] <- 0 #deal with nan
+  GraftsPerGraftedTreeAvg<-mean(GraftsPerTreeVec[GraftsPerTreeVec>0]) #grafts per grafted tree
+  GraftsPerGraftedTreeAvg[is.nan(GraftsPerGraftedTreeAvg)] <- 0 #deal with nan
+  ProportionGraftedTrees<-sum(GraftsPerTreeVec>0)/sum(PlantGridSim) #proportion of grafted trees
+  ProportionGraftedTrees[is.nan(ProportionGraftedTrees)] <- 0 #deal with nan
+  
+  resultsMat5[r,j]=GraftsPerTreeAvg #average number of grafts per tree
+  resultsMat6[r,j]=ProportionGraftedTrees #proportion of trees with grafts
+  resultsMat7[r,j]=GraftsPerGraftedTreeAvg #average grafts per grafted tree
+  
+  GraftsPerTree_binary<-GraftsPerTreeVec>0
+  n_GraftsPerTree_binary<-GraftsPerTreeVec==0
+
+  g_resultsMat2[r,j]<-ifelse(sum(GraftsPerTree_binary)>0,(sum(fRPPGrid*GraftsPerTree_binary)/(sum(GraftsPerTree_binary))),0)
+  ng_resultsMat2[r,j]<-ifelse((sum(PlantGridSim)-sum(GraftsPerTree_binary))>0,(sum(fRPPGrid*n_GraftsPerTree_binary)/(sum(PlantGridSim)-sum(GraftsPerTree_binary))),0)
+    
+  
+  GraftsPerTree_binary<-Original_GraftsPerTreeVec>0
+  n_GraftsPerTree_binary<-Original_GraftsPerTreeVec==0
+
+  original_g_resultsMat2[r,j]<-ifelse(sum(GraftsPerTree_binary)>0,(sum(fRPPGrid*GraftsPerTree_binary)/(sum(GraftsPerTree_binary))),0)
+  original_ng_resultsMat2[r,j]<-ifelse((sum(PlantGridSim)-sum(GraftsPerTree_binary))>0,(sum(fRPPGrid*n_GraftsPerTree_binary)/(sum(PlantGridSim)-sum(GraftsPerTree_binary))),0)
+    
+  
+
+}
+
+}
+    
+}
+
+
+resultsMat8[resultsMat8==0]<-NA #take out the 0s for stands which did not die over the timestepping period
+
+```
+
+# graph average trends
+This section plots the average results for each of the things I tracked vs the grafting tendency parameter. 
+```{r}
+gvec<-gStepSize*(1:glength) #vector of graftiness values 
+
+#create data frame of average results from all runs
+DF_ALL_AVG<-cbind(gvec,
+                  colMeans(resultsMat),
+                  colMeans(resultsMat2),
+                  colMeans(resultsMat3),
+                  colMeans(resultsMat4),
+                  colMeans(resultsMat5),
+                  colMeans(resultsMat6),
+                  colMeans(resultsMat7),
+                  colMeans(resultsMat8, na.rm=T),
+                  colSums(resultsMat>0)/reps) %>% 
+  as.data.frame()
+
+#name df columns
+colnames(DF_ALL_AVG)<-c("g", 
+                        "surviving_trees", 
+                        "RPP", 
+                        "initial_grafts_per_tree",
+                        "initial_percent_grafted", 
+                        "final_grafts_per_tree", 
+                        "final_percent_grafted", 
+                        "final_grafts_per_grafted_tree",
+                        "stand_death_timestep",
+                        "proportion_stands_surviving")
+
+#view head of data frame
+head(DF_ALL_AVG, n=glength)
+
+#make plots against g
+
+#surviving trees
+ggplot(DF_ALL_AVG, aes(x=g))+
+  geom_line(aes(y=surviving_trees))
+
+#resources per tree
+ggplot(DF_ALL_AVG, aes(x=g))+
+  geom_line(aes(y=RPP))
+
+#initial and final grafts per tree
+ggplot(DF_ALL_AVG, aes(x=g))+
+  geom_line(aes(y=initial_grafts_per_tree), color="red2")+
+  geom_line(aes(y=final_grafts_per_tree), color="blue2")
+
+#initial and final proportion grafted
+ggplot(DF_ALL_AVG, aes(x=g))+
+  geom_line(aes(y=initial_percent_grafted), color="red2")+
+  geom_line(aes(y=final_percent_grafted), color="blue2")
+
+#grafts per grafted tree
+ggplot(DF_ALL_AVG, aes(x=g))+
+  geom_line(aes(y=final_grafts_per_grafted_tree))
+
+#stand death 
+ggplot(DF_ALL_AVG, aes(x=g))+
+  geom_line(aes(y=stand_death_timestep))
+
+#surviving stands
+ggplot(DF_ALL_AVG, aes(x=g))+
+  geom_line(aes(y=proportion_stands_surviving))
+
+  
+```
+
+
+# All Data
+This section creates a data frame with all the data collected across all the simulation runs
+```{r}
+#CREATE DATA FRAME WITH ALL DATA FROM ALL RUNS
+
+# tree survival
+survival<-cbind(gvec,t(resultsMat)) %>% 
+  as.data.frame() #create data frame
+colnames(survival)<-c("g", as.character(1:reps)) #name columns
+survival<-survival %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "surviving_trees") #pivot longer
+
+#resources
+resources<-cbind(gvec, t(resultsMat2))%>% 
+  as.data.frame()
+colnames(resources)<-c("g", as.character(1:reps))
+resources<-resources %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "RPP")
+
+#start data frame with left join
+DATA_ALL_REPS<-left_join(survival, resources)
+
+#inital grafts per tree
+initial_GPT<-cbind(gvec, t(resultsMat3))%>% 
+  as.data.frame()
+colnames(initial_GPT)<-c("g", as.character(1:reps))
+initial_GPT<-initial_GPT %>% 
+  pivot_longer( !g, names_to = "replicate", values_to = "initial_grafts_per_tree")
+
+#add initial gpt to data frame
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, initial_GPT)
+
+#initial percent grafted
+initial_percent<-cbind(gvec, t(resultsMat4))%>%
+  as.data.frame()
+colnames(initial_percent)<-c("g", as.character(1:reps))
+initial_percent<-initial_percent %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "initial_percent_grafted")
+
+#add to data frame
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, initial_percent)
+
+#final  grafts er tree
+final_GPT<-cbind(gvec, t(resultsMat5))%>%
+  as.data.frame()
+colnames(final_GPT)<-c("g", as.character(1:reps))
+final_GPT<-final_GPT %>% 
+  pivot_longer( !g, names_to = "replicate", values_to = "final_grafts_per_tree")
+
+#add to data frame
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, final_GPT)
+
+#final percent grafted
+final_percent<-cbind(gvec, t(resultsMat6))%>%
+  as.data.frame()
+colnames(final_percent)<-c("g", as.character(1:reps))
+final_percent<-final_percent %>% 
+  pivot_longer( !g, names_to = "replicate", values_to = "final_percent_grafted")
+
+#add to data frame
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, final_percent)
+
+
+#grafts per grafted tree
+final_grafts_per_grafted_tree<-cbind(gvec, t(resultsMat7))%>% 
+  as.data.frame()
+colnames(final_grafts_per_grafted_tree)<-c("g", as.character(1:reps))
+final_grafts_per_grafted_tree<-final_grafts_per_grafted_tree %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "final_grafts_per_grafted_tree")
+#add to data frame
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, final_grafts_per_grafted_tree)
+
+#stand death
+death<-cbind(gvec, t(resultsMat8))%>% as.data.frame()
+colnames(death)<-c("g", as.character(1:reps))
+death<-death %>% pivot_longer( !g, names_to = "replicate", values_to = "stand_death_timestep")
+
+#add to df
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, death)
+
+
+# grafted tree resource
+final_grafted_trees_RPP<-cbind(gvec,t(g_resultsMat2)) %>% 
+  as.data.frame() #create data frame
+colnames(final_grafted_trees_RPP)<-c("g", as.character(1:reps)) #name columns
+final_grafted_trees_RPP<-final_grafted_trees_RPP %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "final_grafted_trees_RPP") #pivot longer
+
+#add to df
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, final_grafted_trees_RPP)
+
+
+# non grafted tree resource
+final_nongrafted_trees_RPP<-cbind(gvec,t(ng_resultsMat2)) %>% 
+  as.data.frame() #create data frame
+colnames(final_nongrafted_trees_RPP)<-c("g", as.character(1:reps)) #name columns
+final_nongrafted_trees_RPP<-final_nongrafted_trees_RPP %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "final_nongrafted_trees_RPP") #pivot longer
+
+#add to df
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, final_nongrafted_trees_RPP)
+
+
+# grafted tree resource original
+original_grafted_trees_RPP<-cbind(gvec,t(original_g_resultsMat2)) %>% 
+  as.data.frame() #create data frame
+colnames(original_grafted_trees_RPP)<-c("g", as.character(1:reps)) #name columns
+original_grafted_trees_RPP<-original_grafted_trees_RPP %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "original_grafted_trees_RPP") #pivot longer
+
+#add to df
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, original_grafted_trees_RPP)
+
+# nongrafted tree resource original
+original_nongrafted_trees_RPP<-cbind(gvec,t(original_ng_resultsMat2)) %>% 
+  as.data.frame() #create data frame
+colnames(original_nongrafted_trees_RPP)<-c("g", as.character(1:reps)) #name columns
+original_nongrafted_trees_RPP<-original_nongrafted_trees_RPP %>%
+  pivot_longer( !g, names_to = "replicate", values_to = "original_nongrafted_trees_RPP") #pivot longer
+
+#add to df
+DATA_ALL_REPS<-left_join(DATA_ALL_REPS, original_nongrafted_trees_RPP)
+```
+
+# PLOTTING
+This upcoming section plots the graphs for all the data for each combination of variables. 
+```{r}
+ggplot()+
+    geom_point(data=DATA_ALL_REPS,aes(x=g, y=surviving_trees), position="jitter", shape=1, alpha=0.5)+
+    geom_smooth(data=DATA_ALL_REPS,aes(x=g, y=surviving_trees), method = "loess")+
+    ggtitle("Surviving trees vs g under a static resource regime")+
+    xlab("Grafting tendency g") +
+    ylab("Alive trees after 300 timesteps")
+
+ggplot()+
+    geom_point(data=DATA_ALL_REPS,aes(x=g, y=RPP), position="jitter", shape=1, alpha=0.5)+
+    geom_smooth(data=DATA_ALL_REPS,aes(x=g, y=RPP), method = "loess")+
+    ggtitle("Stored resources vs g under a static resource regime")+
+    xlab("Grafting tendency g") +
+    ylab("Mean stored resource per tree after 300 timesteps")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=surviving_trees), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=gvec, y=surviving_trees))+
+  ggtitle("surviving trees")+
+  xlab("grafting tendency g") +
+  ylab("alive trees")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=RPP), position="jitter", shape=1, alpha=0.5)+
+   geom_line(data=DF_ALL_AVG, aes(x=gvec, y=RPP))+
+  ggtitle("resource per tree")+
+  xlab("grafting tendency g") +
+  ylab("resource")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=initial_grafts_per_tree), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=gvec, y=initial_grafts_per_tree))+
+  ggtitle("initial grafts per tree")+
+  xlab("grafting tendency g") +
+  ylab("initial grafts per tree")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=initial_percent_grafted), position="jitter", shape=1, alpha=0.5)+
+   geom_line(data=DF_ALL_AVG, aes(x=gvec, y=initial_percent_grafted))+
+  ggtitle("initial proportion grafted trees")+
+  xlab("grafting tendency g") +
+  ylab("initial proportion grafted")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=final_grafts_per_tree), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=gvec, y=final_grafts_per_tree))+
+  ggtitle("final grafts per tree")+
+  xlab("grafting tendency g") +
+  ylab("final grafts per tree")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=final_percent_grafted), position="jitter", shape=1, alpha=0.5)+
+   geom_line(data=DF_ALL_AVG, aes(x=gvec, y=final_percent_grafted))+
+  ggtitle("final proportion grafted trees")+
+  xlab("grafting tendency g") +
+  ylab("final proportion grafted")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=final_grafts_per_grafted_tree), position="jitter", shape=1, alpha=0.5)+
+   geom_line(data=DF_ALL_AVG, aes(x=gvec, y=final_grafts_per_grafted_tree))+
+  ggtitle("final grafts per grafted trees")+
+  xlab("grafting tendency g") +
+  ylab("final grafts per grafted tree")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=stand_death_timestep), position="jitter", shape=1, alpha=0.5)+
+   geom_line(data=DF_ALL_AVG, aes(x=gvec, y=stand_death_timestep))+
+  ggtitle("stand survival time")+
+  xlab("grafting tendency g") +
+  ylab("stand death timestep")
+
+
+```
+```{r}
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_grafts_per_tree, y=surviving_trees), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_grafts_per_tree, y=surviving_trees))+
+  ggtitle("surviving trees")+
+  xlab("initial_grafts_per_tree") +
+  ylab("alive trees")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=final_grafts_per_tree, y=surviving_trees), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=final_grafts_per_tree, y=surviving_trees))+
+  ggtitle("surviving trees")+
+  xlab("final_grafts_per_tree") +
+  ylab("alive trees")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_percent_grafted, y=surviving_trees), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_percent_grafted, y=surviving_trees))+
+  ggtitle("surviving trees")+
+  xlab("initial_percent_grafted") +
+  ylab("alive trees")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=final_percent_grafted, y=surviving_trees), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=final_percent_grafted, y=surviving_trees))+
+  ggtitle("surviving trees")+
+  xlab("final_percent_grafted") +
+  ylab("alive trees")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=RPP, y=surviving_trees), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=RPP, y=surviving_trees))+
+  ggtitle("Resource per trees")+
+  xlab("RPP") +
+  ylab("alive trees")
+
+
+
+```
+
+```{r}
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_grafts_per_tree, y=RPP), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_grafts_per_tree, y=RPP))+
+  ggtitle("resource per tree")+
+  xlab("initial_grafts_per_tree") +
+  ylab("RPP")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=final_grafts_per_tree, y=RPP), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=final_grafts_per_tree, y=RPP))+
+  ggtitle("resource per tree")+
+  xlab("final_grafts_per_tree") +
+  ylab("RPP")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_percent_grafted, y=RPP), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_percent_grafted, y=RPP))+
+  ggtitle("surviving trees")+
+   ggtitle("resource per tree")+
+  ylab("RPP")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=final_percent_grafted, y=RPP), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=final_percent_grafted, y=RPP))+
+   ggtitle("resource per tree")+
+  xlab("final_percent_grafted") +
+  ylab("RPP")
+
+
+```
+
+
+```{r}
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_grafts_per_tree, y=final_percent_grafted), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_grafts_per_tree, y=final_percent_grafted))+
+  ggtitle("final_percent_grafted")+
+  xlab("initial_grafts_per_tree") +
+  ylab("final_percent_grafted")
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=final_grafts_per_tree, y=final_percent_grafted), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=final_grafts_per_tree, y=final_percent_grafted))+
+  ggtitle("final_percent_grafted")+
+  xlab("final_grafts_per_tree") +
+  ylab("final_percent_grafted")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_percent_grafted, y=final_percent_grafted), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_percent_grafted, y=final_percent_grafted))+
+  ggtitle("final_percent_grafted")+
+  xlab("initial_percent_grafted") +
+  ylab("final_percent_grafted")
+
+
+
+```
+```{r}
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_grafts_per_tree, y=final_grafts_per_tree), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_grafts_per_tree, y=final_grafts_per_tree))+
+  ggtitle("final_grafts_per_tree")+
+  xlab("initial_grafts_per_tree") +
+  ylab("final_grafts_per_tree")
+
+
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_percent_grafted, y=final_grafts_per_tree), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_percent_grafted, y=final_grafts_per_tree))+
+  ggtitle("final_grafts_per_tree")+
+  xlab("initial_percent_grafted") +
+  ylab("final_grafts_per_tree")
+
+
+
+```
+```{r}
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=initial_grafts_per_tree, y=initial_percent_grafted), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_grafts_per_tree, y=initial_percent_grafted))+
+  ggtitle("initial_percent_grafted")+
+  xlab("initial_grafts_per_tree") +
+  ylab("initial_percent_grafted")
+
+```
+
+```{r}
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS %>% filter(stand_death_timestep>0),aes(x=initial_grafts_per_tree, y=stand_death_timestep), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_grafts_per_tree, y=stand_death_timestep))+
+  ggtitle("stand_death_timestep")+
+  xlab("initial_grafts_per_tree") +
+  ylab("stand_death_timestep")
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS %>% filter(stand_death_timestep>0),aes(x=initial_percent_grafted, y=stand_death_timestep), position="jitter", shape=1, alpha=0.5)+
+  geom_line(data=DF_ALL_AVG, aes(x=initial_percent_grafted, y=stand_death_timestep))+
+  ggtitle("stand_death_timestep")+
+  xlab("initial_percent_grafted") +
+  ylab("stand_death_timestep")
+
+
+```
+
+
+
+```{r}
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=final_grafted_trees_RPP), position="jitter", shape=1, alpha=0.5)+
+  #geom_smooth(data=DATA_ALL_REPS, aes(x=g, y=final_grafted_trees_RPP), method="loess")+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=final_nongrafted_trees_RPP), position="jitter", shape=1, alpha=0.5, color="red")+
+  #geom_smooth(data=DATA_ALL_REPS, aes(x=g, y=final_nongrafted_trees_RPP),method="loess", color="red")+
+  ggtitle("RPP by grafting")+
+  xlab("grafting tendency g") +
+  ylab("RPP")
+
+
+pairwise_DF<-DATA_ALL_REPS %>% filter(final_grafted_trees_RPP>0,final_nongrafted_trees_RPP>0) %>% select(g,final_grafted_trees_RPP,final_nongrafted_trees_RPP) %>% mutate(difference=final_grafted_trees_RPP-final_nongrafted_trees_RPP)
+
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=final_grafted_trees_RPP), position="jitter", shape=1, alpha=0.5)+
+  #geom_smooth(data=DATA_ALL_REPS, aes(x=g, y=final_grafted_trees_RPP), method="loess")+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=final_nongrafted_trees_RPP), position="jitter", shape=1, alpha=0.5, color="red")+
+  #geom_smooth(data=DATA_ALL_REPS, aes(x=g, y=final_nongrafted_trees_RPP),method="loess", color="red")+
+  ggtitle("RPP by grafting")+
+  xlab("grafting tendency g") +
+  ylab("RPP")
+
+
+ggplot(pairwise_DF)+
+  geom_point(aes(x=g,y=(final_grafted_trees_RPP)))+
+  geom_point(aes(x=g,y=(final_nongrafted_trees_RPP)), color="red")+
+  geom_smooth(aes(x=g,y=(final_grafted_trees_RPP)))+
+  geom_smooth(aes(x=g,y=(final_nongrafted_trees_RPP)), color="red")
+
+  
+```
+
+```{r}
+
+ggplot()+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=original_grafted_trees_RPP), position="jitter", shape=1, alpha=0.5)+
+  #geom_smooth(data=DATA_ALL_REPS, aes(x=g, y=original_grafted_trees_RPP), method="loess")+
+  geom_point(data=DATA_ALL_REPS,aes(x=g, y=original_nongrafted_trees_RPP), position="jitter", shape=1, alpha=0.5, color="red")+
+  #geom_smooth(data=DATA_ALL_REPS, aes(x=g, y=original_nongrafted_trees_RPP),method="loess", color="red")+
+  ggtitle("RPP by grafting")+
+  xlab("grafting tendency g") +
+  ylab("RPP")
+
+```
+

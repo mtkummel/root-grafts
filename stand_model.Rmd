@@ -1,0 +1,206 @@
+---
+title: "stand model"
+output: html_document
+date: "2023-04-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(reshape)
+```
+
+
+```{r}
+N_0<-20
+g<-0.1
+f<-0.05
+
+#say that the distribution of resources is log normal
+resource_mean<-2
+resource_SD<-20
+mu<-log(resource_mean^2/(sqrt(resource_mean^2+resource_SD^2)))
+sigma<-sqrt(log(1+((resource_SD^2)/(resource_mean^2))))
+
+death_threshold<-1
+
+timesteps<-100
+```
+
+```{r}
+#common pool, average behavior
+N<-100
+N_track<-vector(mode="numeric", length=timesteps)
+for (t in 1:timesteps) {
+  if (N>0) {
+    trees_inital_uptake<-rlnorm(N,meanlog = mu,sdlog=sigma)
+  trees_graft_export<-g*N*f*trees_inital_uptake
+  common_pool<-sum(trees_graft_export)
+  trees_final_uptake<- (trees_inital_uptake- trees_graft_export)+ common_pool/N
+  tree_survival<-(trees_final_uptake>death_threshold)
+  N<-sum(tree_survival)
+  }
+  N_track[t]<-N
+} 
+
+plot(1:timesteps,N_track)
+```
+
+```{r}
+stand_death_func<-function(replicate,g_val,sd_val,N_0,timesteps, resource_mean_val){
+  N<-N_0
+N_track<-vector(mode="numeric", length=timesteps)
+for (t in 1:timesteps) {
+  if (N>0) {
+    trees_inital_uptake<-rlnorm(N,meanlog = resource_mean,sdlog=resource_SD)
+  trees_graft_export<-g_val*N*f*trees_inital_uptake
+  common_pool<-sum(trees_graft_export)
+  trees_final_uptake<- (trees_inital_uptake- trees_graft_export)+ common_pool/N
+  tree_survival<-(trees_final_uptake>=death_threshold)
+  N<-sum(tree_survival)
+  }
+  N_track[t]<-N
+} 
+N_final<-N_track[timesteps]
+death_time_which<-which(N_track==0)
+death_time<-ifelse(N_final==0,death_time_which[1],NA)
+return(death_time)
+}
+```
+```{r}
+stand_death_func2<-function(replicate,g_val,sd_val,N_0,timesteps, resource_mean_val){
+  N<-N_0
+  mu<-log(resource_mean_val^2/(sqrt(resource_mean_val^2+sd_val^2)))
+sigma<-sqrt(log(1+((sd_val^2)/(resource_mean_val^2))))
+N_track<-vector(mode="numeric", length=timesteps)
+for (t in 1:timesteps) {
+  if (N>0) {
+    trees_inital_uptake<-rlnorm(N,meanlog = mu,sdlog=sigma)
+  trees_graft_export<-g_val*N*f*trees_inital_uptake
+  common_pool<-sum(trees_graft_export)
+  trees_final_uptake<- (trees_inital_uptake- trees_graft_export)+ common_pool/N
+  tree_survival<-(trees_final_uptake>=death_threshold)
+  N<-sum(tree_survival)
+  }
+  N_track[t]<-N
+} 
+N_final<-N_track[timesteps]
+death_time_which<-which(N_track==0)
+death_time<-ifelse(N_final==0,death_time_which[1],NA)
+return(death_time)
+}
+
+```
+```{r}
+stand_tree_func<-function(replicate,g_val,sd_val,N_0,timesteps, resource_mean_val){
+  N<-N_0
+  mu<-log(resource_mean_val^2/(sqrt(resource_mean_val^2+sd_val^2)))
+sigma<-sqrt(log(1+((sd_val^2)/(resource_mean_val^2))))
+N_track<-vector(mode="numeric", length=timesteps)
+for (t in 1:timesteps) {
+  if (N>0) {
+    trees_inital_uptake<-rlnorm(N,meanlog = mu,sdlog=sigma)
+  trees_graft_export<-g_val*N*f*trees_inital_uptake
+  common_pool<-sum(trees_graft_export)
+  trees_final_uptake<- (trees_inital_uptake- trees_graft_export)+ common_pool/N
+  tree_survival<-(trees_final_uptake>=death_threshold)
+  N<-sum(tree_survival)
+  }
+  N_track[t]<-N
+} 
+N_final<-N_track[timesteps]
+return(N_final)
+}
+```
+
+
+
+```{r}
+g_vec<-seq(from=0,to=1,by=0.1)
+sd_vec<-c(0,0.01,0.1,0.5,0.75,1,2,3,5,10,20)
+reps<-500
+simulation_results<-matrix(data=0,nrow=length(g_vec),ncol<-length(sd_vec))
+colnames(simulation_results)<-sd_vec
+rownames(simulation_results)<-g_vec
+
+simulation_results_sd<-matrix(data=0,nrow=length(g_vec),ncol<-length(sd_vec))
+colnames(simulation_results_sd)<-sd_vec
+rownames(simulation_results_sd)<-g_vec
+
+simulation_results_surviving_stands<-matrix(data=0,nrow=length(g_vec),ncol<-length(sd_vec))
+colnames(simulation_results_surviving_stands)<-sd_vec
+rownames(simulation_results_surviving_stands)<-g_vec
+
+simulation_results_surviving_trees<-matrix(data=0,nrow=length(g_vec),ncol<-length(sd_vec))
+colnames(simulation_results_surviving_trees)<-sd_vec
+rownames(simulation_results_surviving_trees)<-g_vec
+
+for (i in 1:length(g_vec)) {
+  g<-g_vec[i]
+  for (j in 1:length(sd_vec)) {
+    resource_SD<-sd_vec[j]
+    death_times<-sapply(1:reps, stand_death_func2,g_val=g,sd_val=resource_SD,N_0=20,timesteps = 100,resource_mean_val = resource_mean)
+  death_time_mean<-mean(death_times, na.rm=T) 
+  death_time_sd<-sd(death_times, na.rm=T) 
+  simulation_results[i,j]<-death_time_mean
+  simulation_results_sd[i,j]<-death_time_sd
+  simulation_results_surviving_stands[i,j]<-sum(is.na(death_times))
+  
+  tree_nums<-sapply(1:reps, stand_tree_func,g_val=g,sd_val=resource_SD,N_0=20,timesteps = 100,resource_mean_val = resource_mean)
+  simulation_results_surviving_trees[i,j]<-mean(tree_nums, na.rm=T) 
+  }
+}
+```
+
+```{r}
+mean_melt<-melt(simulation_results)
+mean_melt$X1<-as.factor(mean_melt$X1)
+mean_melt$X2<-as.factor(mean_melt$X2)
+colnames(mean_melt)<-c("grafting proportion g","resource variation (distribution sd)","timesteps to stand death")
+ggplot(mean_melt,aes(x=`grafting proportion g`,y=`resource variation (distribution sd)`))+
+  geom_tile(aes(fill=`timesteps to stand death`))+
+  scale_fill_gradient(low = "blue",
+  high = "darkorange") +
+  ggtitle("Average death time for stands")
+
+survival_melt<-melt(simulation_results_surviving_stands)
+survival_melt$X1<-as.factor(survival_melt$X1)
+survival_melt$X2<-as.factor(survival_melt$X2)
+survival_melt$value<-survival_melt$value/reps
+colnames(survival_melt)<-c("grafting proportion g","resource variation (distribution sd)","surviving trees")
+ggplot(survival_melt,aes(x=`grafting proportion g`,y=`resource variation (distribution sd)`))+
+  geom_tile(aes(fill=`surviving trees`))+
+  scale_fill_gradient(low = "lightgray",
+  high = "darkblue") +
+  ggtitle("proportion of stands surviving 100 timesteps ")
+
+sd_melt<-melt(simulation_results_sd)
+sd_melt$X1<-as.factor(sd_melt$X1)
+sd_melt$X2<-as.factor(sd_melt$X2)
+
+colnames(sd_melt)<-c("grafting proportion g","resource variation (distribution sd)","sd across simulations")
+ggplot(sd_melt,aes(x=`grafting proportion g`,y=`resource variation (distribution sd)`))+
+  geom_tile(aes(fill=`sd across simulations`))+
+  scale_fill_gradient(low = "white",
+  high = "green4") 
+
+trees_melt<-melt(simulation_results_surviving_trees)
+trees_melt$X1<-as.factor(trees_melt$X1)
+trees_melt$X2<-as.factor(trees_melt$X2)
+colnames(trees_melt)<-c("grafting proportion g","resource variation (distribution sd)","surviving trees")
+ggplot(trees_melt,aes(x=`grafting proportion g`,y=`resource variation (distribution sd)`))+
+  geom_tile(aes(fill=`surviving trees`))+
+  scale_fill_gradient(low = "white",
+  high = "darkred") +
+  ggtitle("Average number of trees surviving 100 timesteps ")
+
+
+
+image(simulation_results)
+image(simulation_results_surviving_stands)
+```
+

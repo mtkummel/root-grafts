@@ -1,0 +1,677 @@
+---
+title: " allometric model"
+output:
+  html_document: default
+  pdf_document: default
+date: '2022-06-14'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Model
+```{r libraries}
+library(tidyverse)
+library (rootSolve)
+
+```
+
+
+```{r constants}
+#constants for root mass, root radius, and canopy radius and leaf area
+m_const<-25.5
+#root mass ( dbh vs mass https://www.sciencedirect.com/science/article/pii/S0961953411003874?casa_token=i_Amf1zZCcMAAAAA:iRaxjopt55sVRRWOfKXIrXS5IWLGZTtt-75qaeiwKcqqKp6fzqG0rlmGDQ-j28INRmSzfufApg)
+r_const<-133.69 #root radius
+c_const<-62.7034 #canopy radius
+LA_const<-8125 #leaf area
+
+#exponents
+a<-2.134 #root mass
+b<-2/3 #root radius
+beta<-.76 #canopy radius  #perhaps this should be 4/3 2009 west
+alpha<-2 #leaf area
+
+#other const.
+r_dens<-0.2 # density of root tissue g/cm^3(?) (ranges from 0.2 to 0.8 g/cm^3 in https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/j.1365-2435.2012.02020.x)
+
+P<-6 #number of neighbors
+sp_prop<-1 #proportion of forest that is of the focal sp
+
+gamma<--2 #Our model shows how the number of trees in a size class, (delta)nk, decreases with trunk radius, rk, as (delta)nk /prop rk-2
+fine_root_only<-86.9
+adult_size<-2.5
+#cm radius
+```
+
+# allometric functions
+```{r allometric functions}
+#leaf area
+LA_func<-function(rad_stem){
+  Area<-LA_const*rad_stem^alpha
+  return(Area)
+}
+
+#canopy radius
+Canopy_func<-function(rad_stem){
+  Radius<-c_const*rad_stem^beta
+  return(Radius)
+}
+
+
+#root radius
+Root_rad_func<-function(rad_stem){
+  Radius<-r_const*rad_stem^b
+  return(Radius)
+}
+
+#rroot mass 
+Root_mass_func<-function(rad_stem){
+  M<-m_const*rad_stem^a
+  return(M)
+}
+
+
+
+
+
+```
+
+# other functions
+```{r other func}
+
+#Canopy area
+Canopy_A_func<-function(rad_stem){
+  Radius<-Canopy_func(rad_stem)
+  A<-pi*Radius^2
+  return(A)
+}
+
+#root Volume (hemisphere)
+Root_vol_func<-function(rad_stem){
+  Radius<-Root_rad_func(rad_stem)
+  V<-2/3*pi*Radius^3
+  return(V)
+}
+
+
+# root Density
+root_density_func<-function(rad_stem){
+  r_tissue_vol<-Root_mass_func(rad_stem)/r_dens
+  delta<-r_tissue_vol/Root_vol_func(rad_stem)
+  return(delta)
+}
+
+#root vol overlap
+V_overlap_func<-function(rad_stem, dist){
+  r_root<-Root_rad_func(rad_stem)-fine_root_only
+  r_root[r_root<0]<-0# structural roots
+  difference_term<-2*r_root-dist
+  difference_term[difference_term<0]<-0
+  V<-(pi*((difference_term)^2)*(dist^2+4*dist*r_root))/(24*dist)
+  #if ((2*r_root-dist)>0) {
+  #  V<-(pi*((2*r_root-dist)^2)*(dist^2+4*dist*r_root))/(24*dist)
+  #}else{
+  #  V<-0
+  #}
+  
+  return(V)
+}
+V_overlap_func_conical<-function(rad_stem, dist){
+  r_root<-Root_rad_func(rad_stem)
+  V<-(pi*((2*r_root-dist)^2)*(dist^2+4*r_root))/(24*dist)
+  return(V)
+}
+  
+```
+
+## Now find 'average' tree
+```{r avg radius setup}
+
+Av_tree_func<-function(r_max1){
+if (gamma==-2) {
+   avg_r<-(((gamma+1)*(r_max1^(-gamma)))/(r_max1-adult_size^(gamma+1)*r_max1^(-gamma)))*log(r_max1/adult_size) #note log-ln
+}
+  if (gamma!=-2) {
+   avg_r<-(((gamma+1)*r_max1^(-gamma))/((gamma+2)(r_max1-adult_size^(gamma+1)*r_max1^(-gamma))))*(r_max1^(gamma+2)-adult_size^(gamma+2))
+ }
+   return(avg_r)
+ }
+```
+
+```{r avg radius calculate}
+
+r_max_vec<-seq(from=adult_size+1,to=100, by=.1)
+
+r_avg_vec<-Av_tree_func(r_max_vec)
+  
+ggplot()+
+  geom_line(aes(x=r_max_vec,y=r_avg_vec))+
+  ggtitle("Average Tree Radius Vs Maximum Tree Radius")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Average Radius (cm)")
+```
+
+# set up variable
+```{r stemvec avg}
+r_stem_vec<-r_avg_vec
+
+```
+
+
+
+# find missing canopy cover
+
+```{r M avg}
+
+#leaf area density across the whole forest
+leaf_area_density_total<-LA_func(r_max_vec)/Canopy_A_func(r_max_vec)
+
+#missing leaf area above a single canopy
+M_LA<-leaf_area_density_total*Canopy_A_func(r_stem_vec)-LA_func(r_stem_vec)
+
+#extra LA [per neighbor] required to fill leaf area deficit
+overlap_per_neighbor<-M_LA/P
+
+#overlap proportion per neighbor
+f<-overlap_per_neighbor/LA_func(r_stem_vec)
+
+#dist_func
+ggplot()+
+  geom_line(aes(x=r_max_vec,y=f))+
+  ggtitle("Canopy Overlap Vs Maximum Tree Radius")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Fraction of Canopy Overlap")
+ggplot()+
+  geom_line(aes(x=r_avg_vec,y=f))+
+  ggtitle("Canopy Overlap Vs Average Tree Radius ")+
+  xlab("Average Radius (cm)") +
+  ylab("Fraction of Canopy Overlap")
+
+```
+
+# determine distance between trees
+```{r dist avg}
+
+  fun2<-function(x, frac){
+  func<-x-pi*frac-sin(x) #solve for interior angle theta
+  return(func)
+}
+```
+
+
+```{r dist2 avg}
+dist_vec<-vector(mode="numeric", length = length(r_stem_vec))
+
+#perhaps need to increase number of neighbors for really small trees
+
+dist_vec<-vector(mode="numeric", length = length(r_stem_vec))
+for (i in 1:length(r_stem_vec)) {
+    s<-uniroot(f=fun2,interval = c(0,200), frac=f[i])
+  dist_vec[i]<-cos(as.numeric(s[1])/2)*Canopy_func(r_stem_vec[i])*2
+}
+
+ggplot()+
+  geom_line(aes(x=r_avg_vec,y=dist_vec))+
+  ggtitle("Average Intertree Distance ")+
+  xlab("Average Radius (cm)") +
+  ylab("Distance (cm)")
+
+ggplot()+
+  geom_line(aes(x=r_max_vec,y=dist_vec))+
+  ggtitle("Average Intertree Distance ")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Distance (cm)")
+  
+  
+```
+
+
+# Calculate grafts
+```{r calculate grafts}
+root_density<-root_density_func(r_stem_vec)
+V_overlap<-V_overlap_func(r_stem_vec,dist_vec)
+
+GraftsPerNeighbor<-root_density^2*V_overlap
+
+GraftsPerTree<-GraftsPerNeighbor*P*sp_prop
+
+```
+
+
+
+```{r plot grafts vs rmax}
+ggplot()+
+  geom_line(aes(x=r_max_vec,y=GraftsPerTree), color="steelblue", size=1.5)+
+  ggtitle("Predicted Grafts per Average Tree \nVs Maximum Tree Radius")+
+  xlab("Maximum Radius (cm)") +
+  ylab("Grafts per Tree")
+
+plot(r_max_vec,root_density)
+plot(r_max_vec, V_overlap)
+plot(r_max_vec, dist_vec)
+```
+```{r plot grafts vs stemvec}
+ggplot()+
+  geom_line(aes(x=r_avg_vec,y=GraftsPerTree), color="forestgreen", size=1.5)+
+  ggtitle("Predicted Grafts per Average Tree Vs Average Tree Radius")+
+  xlab("Avg Radius (cm)") +
+  ylab("Grafts per Tree")
+
+plot(r_stem_vec,root_density)
+plot(r_stem_vec, V_overlap)
+plot(r_stem_vec, dist_vec)
+```
+
+```{r}
+ggplot()+
+  geom_point(aes(x=dist_vec,y=GraftsPerTree), color="forestgreen", size=1.5)+
+  ggtitle("Predicted grafts per average tree Vs intertree distance of the forest")+
+  xlab("Intertree distance (cm)") +
+  ylab("Grafts per tree")
+```
+
+
+## Re-run model for only 1 forest and range of r_stem values
+# setup variable
+```{r stemvec}
+r_max<-50
+r_stem_vec<-seq(from=1, to=r_max, by=0.1)
+```
+
+
+
+# find missing canopy cover
+
+```{r M}
+
+#leaf area density across the whole forest
+leaf_area_density_total<-LA_func(r_max)/Canopy_A_func(r_max)
+
+#missing leaf area above a single canopy
+M_LA<-leaf_area_density_total*Canopy_A_func(r_stem_vec)-LA_func(r_stem_vec)
+
+#extra LA [per neighbor] required to fill leaf area deficit
+overlap_per_neighbor<-M_LA/P
+
+#overlap proportion per neighbor
+f<-overlap_per_neighbor/LA_func(r_stem_vec)
+
+```
+
+# determine distance between trees
+```{r dist2}
+dist_vec<-vector(mode="numeric", length = length(r_stem_vec))
+
+for (i in 1:length(r_stem_vec)) {
+    s<-uniroot(f=fun2,interval = c(0,200), frac=f[i])
+  dist_vec[i]<-cos(as.numeric(s[1])/2)*Canopy_func(r_stem_vec[i])*2
+}
+
+```
+
+```{r calculate and plot}
+root_density<-root_density_func(r_stem_vec)
+V_overlap<-V_overlap_func(r_stem_vec,dist_vec)
+
+GraftsPerNeighbor<-root_density^2*V_overlap
+
+GraftsPerTree<-GraftsPerNeighbor*P*sp_prop
+
+plot(r_stem_vec,GraftsPerTree)
+plot(r_stem_vec,root_density)
+plot(r_stem_vec, V_overlap)
+plot(r_stem_vec, dist_vec)
+
+ggplot()+
+    geom_line(aes(x=r_stem_vec,y=GraftsPerTree), color="forestgreen", size=1.5)+
+    ggtitle("Predicted grafts for trees of varying radii \nwith an intertree distance of 350 cm")+
+    xlab("Tree radius (cm)") +
+    ylab("Grafts per tree")
+
+```
+
+# Automate and analyze/simulate real data
+
+```{r model-run function w  given max}
+Model_func1<-function(r_maximum){
+  #average tree
+  r_average<-Av_tree_func(r_maximum)
+  
+  
+  #leaf area density across the whole forest
+leaf_area_density_total_mod<-LA_func(r_maximum)/Canopy_A_func(r_maximum)
+
+#missing leaf area above a single canopy
+M_LA_mod<-leaf_area_density_total_mod*Canopy_A_func(r_average)-LA_func(r_average)
+
+#extra LA [per neighbor] required to fill leaf area deficit
+overlap_per_neighbor_mod<-M_LA_mod/P
+
+#overlap proportion per neighbor
+f_mod<-overlap_per_neighbor_mod/LA_func(r_average)
+
+dist_vec_mod<-vector(mode="numeric", length = length(r_average))
+
+for (i in 1:length(r_average)) {
+    s<-uniroot(f=fun2,interval = c(0,200), frac=f_mod[i])
+  dist_vec_mod[i]<-cos(as.numeric(s[1])/2)*Canopy_func(r_average[i])*2
+}
+root_density_mod<-root_density_func(r_average)
+V_overlap_mod<-V_overlap_func(r_average,dist_vec_mod)
+
+GraftsPerNeighbor_mod<-root_density_mod^2*V_overlap_mod
+
+GraftsPerTree_mod<-GraftsPerNeighbor_mod*P*sp_prop
+
+return(GraftsPerTree_mod)
+}
+```
+
+```{r model run func w given average and dist}
+Model_func2<-function(r_average, dist_vec_mod){
+root_density_mod<-root_density_func(r_average)
+V_overlap_mod<-V_overlap_func(r_average,dist_vec_mod)
+
+GraftsPerNeighbor_mod<-root_density_mod^2*V_overlap_mod
+
+GraftsPerTree_mod<-GraftsPerNeighbor_mod*P*sp_prop
+
+return(GraftsPerTree_mod)
+}
+```
+
+```{r}
+radius_const<-8
+distance_vary<-seq(from=20,to=1000, by=0.5)
+graft_vary<-Model_func2(radius_const, distance_vary)
+
+ggplot()+
+  geom_point(aes(x=distance_vary,y=graft_vary), color="forestgreen", size=1.5)+
+  ggtitle("Predicted grafts for an 8cm radius tree \nwith various intertree distances")+
+  xlab("Intertree distance (cm)") +
+  ylab("Grafts per tree")
+
+
+dist_const<-350
+rad_vary<-seq(from=2.5,to=20, by=0.5)
+graft_vary<-Model_func2(rad_vary,dist_const)
+
+ggplot()+
+    geom_point(aes(x=rad_vary,y=graft_vary), color="forestgreen", size=1.5)+
+    ggtitle("Predicted grafts for trees of varying radii \nwith an intertree distance of 350 cm")+
+    xlab("Tree radius (cm)") +
+    ylab("Grafts per tree")
+
+```
+
+
+
+```{r gaspard proof of prediction concept}
+# Gaspard and Deroschers 2020
+
+P<-4
+sp_prop<-1
+predicted_GD_20<- mean(Model_func2(9.01,100))
+
+P<-8
+dist<-.5*100+.5*141
+predicted_GD_20<- mean(Model_func2(9.01,dist))
+ mean(Model_func2(9.01,dist))
+mean(Model_func2(9.01,100))+mean(Model_func2(9.01,141))
+P<-6
+dist<-2*sqrt((10^8)/(pi*10000))
+predicted_GD_20<- mean(Model_func2(9.01,dist))
+
+actual_GD_20<-.38*1.14
+  #38% had grafts, avg of 1.14 grafts per tree
+
+
+```
+
+```{r read csv}
+root_data<-read_csv("root graft data.csv")
+```
+
+
+```{r simple percent grafted}
+summary(lm(data=root_data, formula = observed_percent_grafted~mean_dbh))
+ggplot(root_data,aes(x=mean_dbh, y=observed_percent_grafted))+
+  geom_point( color="steelblue")+
+  geom_smooth(method = "lm")+
+  ggtitle("Percent of trees with root grafts vs mean diameter at breast height (DBH)")+
+  xlab("DBH (cm)") +
+  ylab("Percent of trees with grafts")
+
+summary(lm(data=root_data, formula = observed_percent_grafted~mean_dbh))
+ggplot(root_data,aes(x=mean_dbh, y=observed_percent_grafted))+
+  geom_point( color="steelblue")+
+  geom_smooth(method = "lm")+
+  ggtitle("Percent of trees with root grafts vs mean diameter at breast height (DBH)")+
+  xlab("DBH (cm)") +
+  ylab("Percent of trees with grafts")
+
+summary(lm(data=root_data, formula = observed_percent_grafted~tree_density))
+ggplot(root_data,aes(x=tree_density, y=observed_percent_grafted))+
+  geom_point(aes(color=species))+
+  ggtitle("Percent of trees with root grafts vs stand density)")+
+  xlab("Stand density (trees per hectare))") +
+  ylab("Percent of trees with grafts")
+
+summary(lm(data=root_data, formula = observed_percent_grafted~tree_age_avg))
+ggplot(root_data,aes(x=tree_age_avg, y=observed_percent_grafted))+
+  geom_point(aes(color=species))+
+  ggtitle("Percent of trees with root grafts vs Average tree age in stand")+
+  xlab("Average tree age (yrs)") +
+  ylab("Percent of trees with grafts")
+```
+
+```{r interactions percent grafted}
+summary(lm(data=root_data, formula = observed_grafts_per_tree~tree_density*type))
+ggplot(root_data,aes(x=tree_density, y=observed_grafts_per_tree))+
+  geom_point( aes(color=type))+
+  geom_smooth(aes(color=type),method="lm")+
+  ggtitle("Number of grafts per tree vs tree density by stand type")+
+  xlab("density (trees/ha)") +
+  ylab("Grafts per tree")
+
+summary(lm(data=root_data, formula = observed_grafts_per_tree~mean_dbh*type))
+ggplot(root_data,aes(x=mean_dbh, y=observed_grafts_per_tree))+
+  geom_point( aes(color=type))+
+  geom_smooth(aes(color=type),method="lm")+
+  ggtitle("Number of grafts per tree vs mean dbh by stand type")+
+  xlab("mean dbh (cm)") +
+  ylab("Grafts Per Tree")
+
+
+summary(lm(data=root_data, formula = observed_grafts_per_tree~tree_age_avg))
+summary(lm(data=root_data, formula = observed_grafts_per_tree~mean_dbh*type))
+
+
+summary(lm(data=root_data, formula = tree_density~mean_dbh*type))
+ggplot(root_data,aes(x=mean_dbh, y=tree_density))+
+  geom_point( aes(color=type))+
+  geom_smooth(aes(color=type),method="lm")+
+  ggtitle("Percent of trees with root grafts vsmean dbh by stand type")+
+  xlab("mean dbh (cm)") +
+  ylab("tree density (trees/ha)")
+```
+
+
+```{r graphs for thesis}
+root_data<-root_data %>% filter(!is.na(species))
+
+summary(lm(data=root_data, formula = observed_grafts_per_tree~mean_dbh))
+summary(lm(data=root_data, formula = observed_grafts_per_tree~tree_density))
+summary(lm(data=root_data, formula = tree_density~mean_dbh))
+
+ggplot(root_data,aes(x=mean_dbh, y=observed_grafts_per_tree))+
+    geom_point(aes(color=species))+
+    geom_smooth(method="lm")+
+  ggtitle("Average root grafts per tree vs mean DBH across stands")+
+  xlab("Mean DBH (cm)") +
+  ylab("Mean grafts per tree")
+
+ggplot(root_data,aes(x=tree_density, y=observed_grafts_per_tree))+
+    geom_point(aes(color=species))+
+  ggtitle("Average root grafts per tree vs stand density across stands")+
+  xlab("Tree density (trees/ha)") +
+  ylab("Mean grafts per tree")
+
+ggplot(root_data,aes(x=mean_dbh, y=tree_density))+
+    geom_point(aes(color=species))+
+    geom_smooth(method="lm")+
+  ggtitle(" Trends in stand density vs mean stand DBH")+
+  xlab("Mean dbh (cm)") +
+  ylab("Tree density (trees/ha)")
+```
+
+
+```{r simple grafts per tree}
+summary(lm(data=root_data, formula = observed_grafts_per_tree~mean_dbh))
+ggplot(root_data,aes(x=mean_dbh, y=observed_grafts_per_tree))+
+  geom_point( aes(color=species))+
+  geom_smooth(method = "lm")+
+  ggtitle("Average number of grafts per tree vs DBH")+
+  xlab("DBH (cm)") +
+  ylab("grafts per tree")
+
+summary(lm(data=root_data, formula = observed_grafts_per_tree~tree_density))
+ggplot(root_data,aes(x=tree_density, y=observed_grafts_per_tree))+
+  geom_point( color="steelblue")+
+  ggtitle("Average number of grafts per tree vs tree density")+
+  xlab("density (trees per hectare)") +
+  ylab("grafts per tree")
+
+summary(lm(data=root_data, formula = observed_grafts_per_tree~tree_age_avg))
+ggplot(root_data,aes(x=tree_age_avg, y=observed_grafts_per_tree))+
+  geom_point( color="steelblue")+
+  ggtitle("Average number of grafts per tree vs tree age")+
+  xlab("age (yrs)") +
+  ylab("grafts per tree")
+
+```
+
+
+```{r set up predictions }
+
+#P<-4
+#root_data$distance_approx<-sqrt((10^8)/(root_data$tree_density))
+
+P<-6
+root_data$distance_approx<-2*sqrt((10^8)/(pi*root_data$tree_density))
+
+
+root_data$stem_radius<-.5*root_data$mean_dbh
+root_data$predicted_grafts<-Model_func2(root_data$stem_radius,root_data$distance_approx)
+```
+
+
+```{r analyze and graph predictions}
+
+#root_data <-root_data %>% filter(num_trees>10)
+#root_data <-root_data %>% filter(type!="plantation")
+summary(lm(data=root_data,formula = predicted_grafts~mean_dbh ))
+ggplot(root_data,aes(x=mean_dbh, y=predicted_grafts))+
+  geom_point( color="steelblue")+
+  geom_smooth(method = "lm")+
+  ggtitle("Predicted grafts per tree vs DBH")+
+  xlab("DBH (cm)") +
+  ylab("grafts per tree")
+
+
+summary(lm(data=root_data,formula = observed_grafts_per_tree ~predicted_grafts))
+ggplot(root_data,aes(y=observed_grafts_per_tree, x=predicted_grafts))+
+  geom_point( aes(color=species))+
+  geom_smooth(method = "lm")+
+  ggtitle("Predicted vs observed grafts per tree")+
+  xlab("predicted grafts per tree") +
+  ylab("observed grafts per tree")
+
+summary(lm(data=root_data,formula = predicted_grafts~observed_grafts_per_tree ))
+ggplot(root_data,aes(x=observed_grafts_per_tree, y=predicted_grafts))+
+  geom_point( color="steelblue")+
+  geom_smooth(method = "lm")+
+  ggtitle("Observed vs Predicted grafts per tree")+
+  xlab("observed grafts per tree") +
+  ylab("predicted grafts per tree")
+
+summary(lm(data=root_data,formula = predicted_grafts~observed_grafts_per_tree *type))
+ggplot(root_data,aes(y=observed_grafts_per_tree, x=predicted_grafts))+
+  geom_point( aes(color=type))+
+  geom_smooth(method = "lm", aes(color=type))+
+  ggtitle("Predicted vs observed grafts per tree by type of stand")+
+  xlab("predicted grafts per tree") +
+  ylab("observed grafts per tree")
+
+summary(lm(data=root_data,formula = observed_grafts_per_tree ~predicted_grafts*type))
+ggplot(root_data,aes(y=observed_grafts_per_tree, x=predicted_grafts))+
+  geom_point( color="steelblue")+
+  geom_smooth(method = "lm", aes(color=type))+
+  ggtitle("Observed vs Predicted grafts per tree by type of stand")+
+  xlab("predicted grafts per tree") +
+  ylab("observed grafts per tree")
+
+
+
+summary(lm(data=root_data,formula = observed_grafts_per_tree~predicted_grafts *species))
+ggplot(root_data,aes(y=observed_grafts_per_tree))+
+  geom_point(aes( x=predicted_grafts,color=species))+
+  geom_smooth(method = "lm", aes(x=predicted_grafts,color=species), se=F)+
+  geom_smooth(aes(x=observed_grafts_per_tree))+
+  ggtitle("Observed vs Predicted grafts per tree by species")+
+  xlab("predicted grafts per tree") +
+  ylab("observed grafts per tree")
+```
+
+
+```{r analyze and graph predictions2}
+ggplot(root_data,aes(x=mean_dbh))+
+  geom_smooth(aes(x=mean_dbh, y=predicted_grafts),method = "lm",color="blue3")+
+  geom_smooth(aes(x=mean_dbh, y=observed_grafts_per_tree),method = "lm",color="red3")+
+  geom_point(aes(x=mean_dbh, y=observed_grafts_per_tree), color="red4")+
+  geom_point(aes(x=mean_dbh, y=predicted_grafts), color="steelblue")+
+  ggtitle("Predicted (blue) and observed (red) \ngrafts per tree vs DBH ")+
+  xlab("DBH (cm)") +
+  ylab("Average number of grafts per tree")
+
+ggplot(root_data,aes(x=mean_dbh))+
+  geom_smooth(aes(x=mean_dbh, y=(predicted_grafts-0.07*(root_data$mean_dbh-15))),method = "lm",color="blue3")+
+  geom_smooth(aes(x=mean_dbh, y=observed_grafts_per_tree),method = "lm",color="red3")+
+  geom_point(aes(x=mean_dbh, y=observed_grafts_per_tree), color="red4")+
+  geom_point(aes(x=mean_dbh, y=(predicted_grafts-0.07*(root_data$mean_dbh-15))), color="steelblue")+
+  ggtitle("Predicted (blue) and observed (red) tree grafts per tree vs DBH ")+
+  xlab("DBH (cm)") +
+  ylab("Average number of grafts per tree")
+
+ggplot(root_data,aes(x=mean_dbh))+
+  geom_smooth(aes(x=observed_grafts_per_tree, y=(predicted_grafts-0.07*(root_data$mean_dbh-15))),method = "lm",color="blue3")+
+  geom_point(aes(x=observed_grafts_per_tree, y=(predicted_grafts-0.07*(root_data$mean_dbh-15))), color="steelblue")+
+  xlab("observed") 
+
+
+```
+
+```{r}
+roots_all_avg<-colMeans(na.omit(root_data[,c(4:9)])) %>% t() %>% as.data.frame()
+
+P=6
+roots_all_avg$distance_approx<-2*sqrt((10^8)/(pi*roots_all_avg$tree_density))
+
+#P=4
+#roots_all_avg$distance_approx<-2*sqrt((10^8)/(pi*roots_all_avg$tree_density))
+
+roots_all_avg$stem_radius<-.5*roots_all_avg$mean_dbh
+roots_all_avg$predicted_grafts<-Model_func2(roots_all_avg$stem_radius,roots_all_avg$distance_approx)
+
+```
+
+```{r other distance measure}
+P<-4
+root_data$distance_approx_squarelattice<-sqrt((10^8)/(root_data$tree_density))
+root_data$stem_radius<-.5*root_data$mean_dbh
+root_data$predicted_grafts_squarelattice<-Model_func2(root_data$stem_radius,root_data$distance_approx_squarelattice)
+
+plot(root_data$stem_radius,root_data$predicted_grafts_squarelattice/root_data$predicted_grafts)
+```
+
